@@ -24,18 +24,22 @@ pub use flush_request::FlushStat;
 pub(crate) use flush_request::WorkerRequest;
 use log::info;
 
+use crate::Chunk;
 use crate::ChunkId;
 use crate::Config;
 use crate::WALRecord;
+use crate::WalLock;
 use crate::WalTypes;
 use crate::api::state_machine::StateMachine;
 use crate::api::wal::WAL;
 use crate::chunk::closed_chunk::ClosedChunk;
 use crate::chunk::open_chunk::OpenChunk;
+use crate::num::format_pad_u64;
 use crate::stat::FlushMetrics;
 use crate::types::Segment;
 use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
 use crate::wal::file_entry::FileEntry;
+use crate::wal::file_persisted::ChunkPersisted;
 use crate::wal::file_persisted::ChunkPersistedCallback;
 pub use crate::wal::file_persisted::ChunkPersistedFn;
 use crate::wal::flush_request::SeqRequest;
@@ -74,6 +78,9 @@ where W: WalTypes
 
     /// Shared with `FlushWorker`; stores aggregated flush metrics.
     flush_metrics: Arc<AtomicFlushMetrics>,
+
+    /// Holds the exclusive lock on the WAL directory for this WAL instance.
+    _dir_lock: WalLock,
 }
 
 impl<W> fmt::Debug for ChunkedWal<W>
@@ -94,7 +101,116 @@ where W: WalTypes
 impl<W> ChunkedWal<W>
 where W: WalTypes
 {
-    /// Creates a new ChunkedWal instance.
+    /// Opens a ChunkedWal instance and replays existing records into a state
+    /// machine.
+    pub fn open<SM>(
+        config: Arc<Config>,
+        state_machine: &mut SM,
+        on_chunk_persisted: ChunkPersistedFn<W>,
+    ) -> Result<Self, io::Error>
+    where
+        SM: StateMachine<W>,
+    {
+        let dir_lock = Self::acquire_lock(&config)?;
+        Self::open_locked(config, state_machine, on_chunk_persisted, dir_lock)
+    }
+
+    /// Acquires the exclusive WAL directory lock.
+    pub fn acquire_lock(config: &Config) -> Result<WalLock, io::Error> {
+        WalLock::new(config)
+    }
+
+    /// Opens a ChunkedWal instance with an already-held WAL directory lock.
+    pub fn open_locked<SM>(
+        config: Arc<Config>,
+        state_machine: &mut SM,
+        on_chunk_persisted: ChunkPersistedFn<W>,
+        dir_lock: WalLock,
+    ) -> Result<Self, io::Error>
+    where
+        SM: StateMachine<W>,
+    {
+        let chunk_ids = Self::load_chunk_ids(&config, &dir_lock)?;
+
+        let mut closed = BTreeMap::new();
+        let mut prev_end_offset = None;
+        let mut prev_checkpoint = None;
+
+        for chunk_id in chunk_ids.iter().copied() {
+            Self::ensure_consecutive_chunks(prev_end_offset, chunk_id)?;
+
+            let (chunk, records) =
+                Chunk::<WALRecord<W>>::open(config.clone(), chunk_id)?;
+
+            on_chunk_persisted(
+                ChunkPersisted {
+                    file: chunk.f.clone(),
+                    starting_offset: chunk.global_start(),
+                    synced_offset: chunk.global_end(),
+                },
+                prev_checkpoint.clone(),
+            );
+
+            for (i, record) in records.iter().enumerate() {
+                let seg = chunk.record_segment(i);
+                state_machine
+                    .apply(record, chunk_id, seg)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+            }
+
+            prev_end_offset = Some(chunk.last_segment().end().0);
+            let checkpoint = Arc::new(state_machine.checkpoint());
+            prev_checkpoint = Some(checkpoint.clone());
+
+            closed.insert(chunk_id, ClosedChunk::new(chunk, checkpoint));
+        }
+
+        let open = Self::reopen_last_closed(&mut closed);
+
+        let open = if let Some(open) = open {
+            open
+        } else {
+            OpenChunk::create(
+                config.clone(),
+                ChunkId(prev_end_offset.unwrap_or_default()),
+                WALRecord::Checkpoint(state_machine.checkpoint()),
+            )?
+        };
+
+        Ok(Self::new(
+            config,
+            closed,
+            open,
+            on_chunk_persisted,
+            dir_lock,
+        ))
+    }
+
+    /// Dumps all records while holding the WAL directory lock.
+    pub fn dump_records<D>(
+        config: &Config,
+        _dir_lock: &WalLock,
+        mut write_record: D,
+    ) -> Result<(), io::Error>
+    where
+        D: FnMut(
+            ChunkId,
+            u64,
+            Result<(Segment, WALRecord<W>), io::Error>,
+        ) -> Result<(), io::Error>,
+    {
+        let chunk_ids = Self::load_chunk_ids(config, _dir_lock)?;
+        for chunk_id in chunk_ids {
+            let it = Chunk::<WALRecord<W>>::dump(config, chunk_id)?;
+            for (i, res) in it.into_iter().enumerate() {
+                write_record(chunk_id, i as u64, res)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Creates a new ChunkedWal instance after recovery has completed.
     ///
     /// # Arguments
     ///
@@ -102,11 +218,12 @@ where W: WalTypes
     /// * `closed` - Map of closed (immutable) chunks indexed by chunk ID
     /// * `open` - The currently active chunk that can be written to
     /// * `on_chunk_persisted` - Callback invoked after chunk data is persisted
-    pub fn new(
+    fn new(
         config: Arc<Config>,
         closed: BTreeMap<ChunkId, ClosedChunk<W>>,
         open: OpenChunk<WALRecord<W>>,
         on_chunk_persisted: ChunkPersistedFn<W>,
+        dir_lock: WalLock,
     ) -> Self {
         let prev_checkpoint =
             closed.iter().last().map(|(_, c)| c.state.clone());
@@ -147,7 +264,83 @@ where W: WalTypes
             sent_seq: 0,
             done_seq,
             flush_metrics,
+            _dir_lock: dir_lock,
         }
+    }
+
+    fn ensure_consecutive_chunks(
+        prev_end_offset: Option<u64>,
+        chunk_id: ChunkId,
+    ) -> Result<(), io::Error> {
+        let Some(prev_end) = prev_end_offset else {
+            return Ok(());
+        };
+
+        if prev_end != chunk_id.offset() {
+            let message = format!(
+                "Gap between chunks: {} -> {}; Can not open, \
+                        fix this error and re-open",
+                format_pad_u64(prev_end),
+                format_pad_u64(chunk_id.offset()),
+            );
+            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+        }
+
+        Ok(())
+    }
+
+    fn reopen_last_closed(
+        closed_chunks: &mut BTreeMap<ChunkId, ClosedChunk<W>>,
+    ) -> Option<OpenChunk<WALRecord<W>>> {
+        {
+            let (_chunk_id, closed) = closed_chunks.iter().last()?;
+
+            if closed.chunk.is_truncated() {
+                return None;
+            }
+        }
+
+        let (_chunk_id, last) = closed_chunks.pop_last().unwrap();
+        let open = OpenChunk::new(last.chunk);
+        Some(open)
+    }
+
+    pub fn load_chunk_ids(
+        config: &Config,
+        _dir_lock: &WalLock,
+    ) -> Result<Vec<ChunkId>, io::Error> {
+        let path = &config.dir;
+        let entries = std::fs::read_dir(path)?;
+        let mut chunk_ids = vec![];
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+
+            let fn_str = file_name.to_string_lossy();
+            if fn_str == WalLock::LOCK_FILE_NAME {
+                continue;
+            }
+
+            let res = Config::parse_chunk_file_name(&fn_str);
+
+            match res {
+                Ok(offset) => {
+                    chunk_ids.push(ChunkId(offset));
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Ignore invalid WAL file name: '{}': {}",
+                        fn_str,
+                        err
+                    );
+                    continue;
+                }
+            };
+        }
+
+        chunk_ids.sort();
+
+        Ok(chunk_ids)
     }
 
     /// Wraps a `WorkerRequest` with an auto-incrementing seq and sends it to

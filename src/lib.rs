@@ -8,6 +8,7 @@ pub mod wal;
 
 mod chunk;
 mod config;
+mod file_lock;
 mod num;
 mod offset_reader;
 
@@ -19,6 +20,7 @@ pub use chunk::chunk_id::ChunkId;
 pub use chunk::closed_chunk::ClosedChunk;
 pub use chunk::open_chunk::OpenChunk;
 pub use config::Config;
+pub use file_lock::WalLock;
 pub use stat::ChunkStat;
 pub use stat::FlushLatencyPercentiles;
 pub use stat::FlushMetrics;
