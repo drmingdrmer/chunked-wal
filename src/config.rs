@@ -167,7 +167,52 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::Config;
+    use crate::ChunkId;
+
+    #[test]
+    fn test_config_defaults() {
+        let config = Config::new("wal-dir");
+
+        assert_eq!("wal-dir", config.dir);
+        assert_eq!(64 * 1024 * 1024, config.read_buffer_size());
+        assert_eq!(1024 * 1024, config.chunk_max_records());
+        assert_eq!(1024 * 1024 * 1024, config.chunk_max_size());
+        assert!(config.truncate_incomplete_record());
+        assert_eq!(Duration::from_millis(1), config.flush_batch_wait());
+        assert_eq!(2048, config.flush_batch_max_items());
+    }
+
+    #[test]
+    fn test_config_overrides() {
+        let mut config = Config::new_full("wal-dir", Some(1), Some(2), Some(3));
+        config.truncate_incomplete_record = Some(false);
+        config.flush_batch_wait = Some(Duration::from_millis(9));
+        config.flush_batch_max_items = Some(0);
+
+        assert_eq!(1, config.read_buffer_size());
+        assert_eq!(2, config.chunk_max_records());
+        assert_eq!(3, config.chunk_max_size());
+        assert!(!config.truncate_incomplete_record());
+        assert_eq!(Duration::from_millis(9), config.flush_batch_wait());
+        assert_eq!(1, config.flush_batch_max_items());
+    }
+
+    #[test]
+    fn test_chunk_path_and_file_name() {
+        let config = Config::new("wal-dir");
+
+        assert_eq!(
+            "r-00_000_000_000_001_200_000.wal",
+            Config::chunk_file_name(ChunkId(1_200_000))
+        );
+        assert_eq!(
+            "wal-dir/r-00_000_000_000_001_200_000.wal",
+            config.chunk_path(ChunkId(1_200_000))
+        );
+    }
 
     #[test]
     fn test_parse_chunk_file_name() {
@@ -189,5 +234,10 @@ mod tests {
             Config::parse_chunk_file_name("rrr-10_100_000_000_001_200_000.wal")
                 .is_err()
         );
+
+        let bad_file_name = format!("r-{}.wal", "_".repeat(26));
+        let err = Config::parse_chunk_file_name(&bad_file_name).unwrap_err();
+        assert_eq!(bad_file_name, err.bad_file_name);
+        assert!(err.reason.contains("cannot parse as u64"));
     }
 }

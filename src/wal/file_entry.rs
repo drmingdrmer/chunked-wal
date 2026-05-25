@@ -61,3 +61,49 @@ where W: WalTypes
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::mpsc::SyncSender;
+
+    use crate::WalTypes;
+    use crate::wal::file_entry::FileEntry;
+    use crate::wal::file_persisted::ChunkPersistedCallback;
+    use crate::wal::file_persisted::ChunkPersistedFn;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct TestWal;
+
+    impl WalTypes for TestWal {
+        type Action = String;
+        type Checkpoint = String;
+        type Callback = SyncSender<Result<(), io::Error>>;
+    }
+
+    fn callback() -> ChunkPersistedCallback<TestWal> {
+        let cb: ChunkPersistedFn<TestWal> = Arc::new(|_persisted, _state| {});
+        ChunkPersistedCallback::new(cb, None)
+    }
+
+    #[test]
+    fn test_file_entry_new_and_format() -> Result<(), io::Error> {
+        let file = Arc::new(tempfile::tempfile()?);
+        let entry = FileEntry::<TestWal>::new(12, file.clone(), callback());
+
+        assert_eq!(12, entry.starting_offset);
+        assert_eq!(0, entry.sync_id);
+        assert!(Arc::ptr_eq(&file, &entry.f));
+        assert_eq!(
+            "FileEntry{ starting_offset: ChunkId(00_000_000_000_000_000_012), sync_id: 0 }",
+            entry.to_string()
+        );
+        assert_eq!(
+            "FileEntry { starting_offset: ChunkId(12), sync_id: 0 }",
+            format!("{entry:?}")
+        );
+
+        Ok(())
+    }
+}

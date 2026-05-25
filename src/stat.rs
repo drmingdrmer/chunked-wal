@@ -108,3 +108,76 @@ where Chkp: fmt::Debug
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ChunkId;
+    use crate::stat::ChunkStat;
+    use crate::stat::FlushLatencyPercentiles;
+    use crate::stat::FlushMetrics;
+
+    #[test]
+    fn test_chunk_stat_display() {
+        let stat = ChunkStat {
+            chunk_id: ChunkId(12),
+            records_count: 3,
+            global_start: 12,
+            global_end: 45,
+            size: 33,
+            log_state: "checkpoint",
+        };
+
+        assert_eq!(
+            "ChunkStat(ChunkId(00_000_000_000_000_000_012)){records: 3, [000_000_012, 000_000_045), size: 000_000_033, log_state: \"checkpoint\"}",
+            stat.to_string()
+        );
+    }
+
+    #[test]
+    fn test_flush_metrics_default_clone_eq() {
+        let metrics = FlushMetrics {
+            batch_count: 1,
+            sync_batch_count: 2,
+            write_request_count: 3,
+            write_bytes: 4,
+            callback_count: 5,
+            group_wait_count: 6,
+            group_wait_us: 7,
+            group_wait_max_us: 8,
+            queued_wait_us: 9,
+            queued_wait_max_us: 10,
+            write_us: 11,
+            write_max_us: 12,
+            sync_us: 13,
+            sync_max_us: 14,
+            batch_us: 15,
+            batch_max_us: 16,
+            batch_size_max: 17,
+            batch_bytes_max: 18,
+            last_batch_size: 19,
+            last_batch_bytes: 20,
+            last_callback_count: 21,
+            last_sync_us: 22,
+            last_queued_wait_max_us: 23,
+            group_wait_percentiles: FlushLatencyPercentiles {
+                p50_us: 24,
+                p90_us: 25,
+                p99_us: 26,
+            },
+            queued_wait_percentiles: FlushLatencyPercentiles::default(),
+            write_percentiles: FlushLatencyPercentiles::default(),
+            sync_percentiles: FlushLatencyPercentiles::default(),
+            batch_percentiles: FlushLatencyPercentiles::default(),
+        };
+
+        assert_eq!(metrics, metrics.clone());
+        assert_eq!(
+            FlushLatencyPercentiles {
+                p50_us: 0,
+                p90_us: 0,
+                p99_us: 0,
+            },
+            FlushLatencyPercentiles::default()
+        );
+    }
+}

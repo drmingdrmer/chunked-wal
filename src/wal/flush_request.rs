@@ -108,3 +108,107 @@ where W: WalTypes
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::mpsc::SyncSender;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Instant;
+
+    use crate::WalTypes;
+    use crate::wal::file_entry::FileEntry;
+    use crate::wal::file_persisted::ChunkPersistedCallback;
+    use crate::wal::file_persisted::ChunkPersistedFn;
+    use crate::wal::flush_request::FlushStat;
+    use crate::wal::flush_request::SeqRequest;
+    use crate::wal::flush_request::WorkerRequest;
+    use crate::wal::flush_request::WriteRequest;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct TestWal;
+
+    impl WalTypes for TestWal {
+        type Action = String;
+        type Checkpoint = String;
+        type Callback = SyncSender<Result<(), io::Error>>;
+    }
+
+    fn callback() -> ChunkPersistedCallback<TestWal> {
+        let cb: ChunkPersistedFn<TestWal> = Arc::new(|_persisted, _state| {});
+        ChunkPersistedCallback::new(cb, None)
+    }
+
+    #[test]
+    fn test_flush_stat_offset_sync_id() {
+        let stat = FlushStat {
+            starting_offset: 12,
+            sync_id: 34,
+            ino: 56,
+        };
+
+        assert_eq!((12, 34), stat.offset_sync_id());
+        assert_eq!(
+            "FlushStat { starting_offset: 12, sync_id: 34, ino: 56 }",
+            format!("{stat:?}")
+        );
+    }
+
+    #[test]
+    fn test_request_debug() -> Result<(), io::Error> {
+        let (tx, _rx) = sync_channel(1);
+        let write = WriteRequest::<TestWal> {
+            upto_offset: 99,
+            data: vec![1, 2, 3],
+            sync: true,
+            callback: Some(tx),
+        };
+        assert_eq!(
+            "WriteRequest { upto_offset: 99, data_len: 3, sync: true, has_callback: true }",
+            format!("{write:?}")
+        );
+
+        let req = WorkerRequest::Write(write);
+        assert_eq!(
+            "Write(WriteRequest { upto_offset: 99, data_len: 3, sync: true, has_callback: true })",
+            format!("{req:?}")
+        );
+
+        let seq_req = SeqRequest {
+            seq: 7,
+            queued_at: Instant::now(),
+            req,
+        };
+        let seq_debug = format!("{seq_req:?}");
+        assert!(seq_debug.contains("SeqRequest"));
+        assert!(seq_debug.contains("seq: 7"));
+        assert!(seq_debug.contains(".."));
+        assert!(matches!(seq_req.req, WorkerRequest::Write(_)));
+
+        let remove = WorkerRequest::<TestWal>::RemoveChunks {
+            chunk_paths: vec!["a".to_string(), "b".to_string()],
+        };
+        assert_eq!(
+            "RemoveChunks { chunk_paths: [\"a\", \"b\"] }",
+            format!("{remove:?}")
+        );
+
+        let (tx, _rx) = sync_channel(1);
+        let stat = WorkerRequest::<TestWal>::GetFlushStat { tx };
+        assert_eq!("GetFlushStat { .. }", format!("{stat:?}"));
+
+        let file = Arc::new(tempfile::tempfile()?);
+        let append = WorkerRequest::AppendFile(FileEntry::<TestWal>::new(
+            12,
+            file,
+            callback(),
+        ));
+        assert_eq!(
+            "AppendFile(FileEntry { starting_offset: ChunkId(12), sync_id: 0 })",
+            format!("{append:?}")
+        );
+
+        Ok(())
+    }
+}

@@ -41,3 +41,17 @@ impl ChunkId {
         self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ChunkId;
+
+    #[test]
+    fn test_chunk_id_format_and_accessors() {
+        let chunk_id = ChunkId::from(1_200_000);
+
+        assert_eq!(1_200_000, *chunk_id);
+        assert_eq!(1_200_000, chunk_id.offset());
+        assert_eq!("ChunkId(00_000_000_000_001_200_000)", chunk_id.to_string());
+    }
+}
