@@ -4,6 +4,7 @@ pub mod wal_record;
 
 pub(crate) mod atomic_flush_metrics;
 pub(crate) mod batch_metrics;
+mod closed_chunk_reader;
 pub(crate) mod file_entry;
 pub(crate) mod flush_request;
 pub(crate) mod flush_worker;
@@ -19,6 +20,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
+pub use closed_chunk_reader::ClosedChunkReader;
 use codeq::OffsetSize;
 pub use flush_request::FlushStat;
 pub(crate) use flush_request::WorkerRequest;
@@ -35,6 +37,7 @@ use crate::api::wal::WAL;
 use crate::chunk::closed_chunk::ClosedChunk;
 use crate::chunk::open_chunk::OpenChunk;
 use crate::num::format_pad_u64;
+use crate::stat::ChunkStat;
 use crate::stat::FlushMetrics;
 use crate::types::Segment;
 use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
@@ -54,9 +57,9 @@ use crate::wal::flush_worker::FlushWorker;
 pub struct ChunkedWal<W>
 where W: WalTypes
 {
-    pub config: Arc<Config>,
-    pub open: OpenChunk<WALRecord<W>>,
-    pub closed: BTreeMap<ChunkId, ClosedChunk<W>>,
+    config: Arc<Config>,
+    open: OpenChunk<WALRecord<W>>,
+    closed: BTreeMap<ChunkId, ClosedChunk<W>>,
 
     /// Sends user write operations to the flush worker.
     ///
@@ -343,6 +346,103 @@ where W: WalTypes
         Ok(chunk_ids)
     }
 
+    pub fn open_chunk_id(&self) -> ChunkId {
+        self.open.chunk.chunk_id()
+    }
+
+    pub fn closed_chunk_stats(&self) -> Vec<ChunkStat<W::Checkpoint>> {
+        self.closed.values().map(|c| c.stat()).collect()
+    }
+
+    pub fn open_chunk_stat(
+        &self,
+        checkpoint: W::Checkpoint,
+    ) -> ChunkStat<W::Checkpoint> {
+        ChunkStat {
+            chunk_id: self.open.chunk.chunk_id(),
+            records_count: self.open.chunk.records_count() as u64,
+            global_start: self.open.chunk.global_start(),
+            global_end: self.open.chunk.global_end(),
+            size: self.open.chunk.chunk_size(),
+            log_state: checkpoint,
+        }
+    }
+
+    pub fn closed_chunk_reader(&self) -> ClosedChunkReader<W> {
+        ClosedChunkReader::new(self.closed.clone())
+    }
+
+    pub fn drain_closed_chunks_while<F>(
+        &mut self,
+        mut should_drain: F,
+    ) -> Vec<ChunkId>
+    where
+        F: FnMut(&W::Checkpoint) -> bool,
+    {
+        let mut chunk_ids = Vec::new();
+
+        while let Some((_chunk_id, closed)) = self.closed.first_key_value() {
+            if !should_drain(closed.state.as_ref()) {
+                break;
+            }
+
+            let (chunk_id, _closed) = self.closed.pop_first().unwrap();
+            chunk_ids.push(chunk_id);
+        }
+
+        chunk_ids
+    }
+
+    pub fn dump_loaded_records<D>(
+        &self,
+        mut write_record: D,
+    ) -> Result<(), io::Error>
+    where
+        D: FnMut(
+            ChunkId,
+            u64,
+            Result<(Segment, WALRecord<W>), io::Error>,
+        ) -> Result<(), io::Error>,
+    {
+        let closed = self.closed.keys().copied();
+        let chunk_ids = closed.chain([self.open.chunk.chunk_id()]);
+
+        for chunk_id in chunk_ids {
+            let f =
+                Chunk::<WALRecord<W>>::open_chunk_file(&self.config, chunk_id)?;
+
+            let it = Chunk::<WALRecord<W>>::load_records_iter(
+                &self.config,
+                Arc::new(f),
+                chunk_id,
+            )?;
+
+            for (i, res) in it.enumerate() {
+                write_record(chunk_id, i as u64, res)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn on_disk_size(&self) -> u64 {
+        let end = self.open.chunk.global_end();
+        let open_start = self.open.chunk.global_start();
+        let first_closed_start = self
+            .closed
+            .first_key_value()
+            .map(|(_, v)| v.chunk.global_start())
+            .unwrap_or(open_start);
+
+        end - first_closed_start
+    }
+
+    pub fn last_closed_chunk_truncated_file_size(&self) -> Option<u64> {
+        self.closed
+            .last_key_value()
+            .and_then(|(_chunk_id, closed)| closed.chunk.truncated_file_size())
+    }
+
     /// Wraps a `WorkerRequest` with an auto-incrementing seq and sends it to
     /// the FlushWorker.
     fn send_request(&mut self, req: WorkerRequest<W>) -> Result<(), io::Error> {
@@ -392,19 +492,24 @@ where W: WalTypes
         }))
     }
 
-    /// Requests removal of specified chunk files.
+    /// Requests removal of specified chunks.
     ///
     /// # Arguments
     ///
-    /// * `chunk_paths` - Paths of chunk files to be removed
+    /// * `chunk_ids` - IDs of chunk files to be removed
     ///
     /// # Errors
     ///
     /// Returns an IO error if the remove request cannot be sent
     pub fn send_remove_chunks(
         &mut self,
-        chunk_paths: Vec<String>,
+        chunk_ids: Vec<ChunkId>,
     ) -> Result<(), io::Error> {
+        let chunk_paths = chunk_ids
+            .into_iter()
+            .map(|chunk_id| self.config.chunk_path(chunk_id))
+            .collect();
+
         self.send_request(WorkerRequest::RemoveChunks { chunk_paths })
     }
 
@@ -840,6 +945,10 @@ mod tests {
         assert_eq!(1, wal.closed.len());
         assert_eq!(
             Some(truncated_from),
+            wal.last_closed_chunk_truncated_file_size()
+        );
+        assert_eq!(
+            Some(truncated_from),
             wal.closed.first_key_value().unwrap().1.chunk.truncated_file_size()
         );
         assert_eq!(
@@ -877,6 +986,10 @@ mod tests {
 
         assert_eq!(vec!["a", "b"], sm.values);
         assert_eq!(1, wal.closed.len());
+        assert_eq!(
+            Some(original_len + 3),
+            wal.last_closed_chunk_truncated_file_size()
+        );
         assert_eq!(
             Some(original_len + 3),
             wal.closed.first_key_value().unwrap().1.chunk.truncated_file_size()
@@ -1004,6 +1117,110 @@ mod tests {
             synced_offset: wal.open.chunk.global_end(),
             checkpoint: Some("a,b".to_string()),
         }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_loaded_chunk_accessors() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        let segment_a = append_action(&mut wal, &mut sm, "a")?;
+        append_action(&mut wal, &mut sm, "b")?;
+        append_action(&mut wal, &mut sm, "c")?;
+        sync_flush(&mut wal)?;
+
+        let open_chunk_id = wal.open_chunk_id();
+        let closed_stats = wal.closed_chunk_stats();
+        let open_stat = wal.open_chunk_stat(sm.checkpoint());
+
+        assert_eq!(1, closed_stats.len());
+        assert_eq!(ChunkId(0), closed_stats[0].chunk_id);
+        assert_eq!(3, closed_stats[0].records_count);
+        assert_eq!("a,b", closed_stats[0].log_state);
+        assert_eq!(open_chunk_id, open_stat.chunk_id);
+        assert_eq!(2, open_stat.records_count);
+        assert_eq!("a,b,c", open_stat.log_state);
+        assert_eq!(open_stat.global_end, wal.on_disk_size());
+        assert_eq!(None, wal.last_closed_chunk_truncated_file_size());
+
+        assert_eq!(
+            WALRecord::Action("a".to_string()),
+            wal.closed_chunk_reader().read_record(ChunkId(0), segment_a)?
+        );
+
+        let mut dumped = Vec::new();
+        wal.dump_loaded_records(|chunk_id, index, res| {
+            dumped.push((chunk_id, index, res.map(|(_segment, rec)| rec)?));
+            Ok(())
+        })?;
+
+        assert_eq!(
+            vec![
+                (ChunkId(0), 0, WALRecord::Checkpoint(String::new())),
+                (ChunkId(0), 1, WALRecord::Action("a".to_string())),
+                (ChunkId(0), 2, WALRecord::Action("b".to_string())),
+                (open_chunk_id, 0, WALRecord::Checkpoint("a,b".to_string())),
+                (open_chunk_id, 1, WALRecord::Action("c".to_string())),
+            ],
+            dumped
+        );
+
+        let drained =
+            wal.drain_closed_chunks_while(|checkpoint| checkpoint == "a,b");
+        assert_eq!(vec![ChunkId(0)], drained);
+        assert!(wal.closed_chunk_stats().is_empty());
+
+        let path = config.chunk_path(ChunkId(0));
+        assert!(std::path::Path::new(&path).exists());
+        wal.send_remove_chunks(drained)?;
+        wal.wait_worker_idle();
+        assert!(!std::path::Path::new(&path).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_drain_closed_chunks_while_stops_at_first_unmatched()
+    -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        for value in ["a", "b", "c", "d", "e"] {
+            append_action(&mut wal, &mut sm, value)?;
+        }
+        sync_flush(&mut wal)?;
+
+        let closed_before = wal
+            .closed_chunk_stats()
+            .into_iter()
+            .map(|stat| (stat.chunk_id, stat.log_state))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![
+                (ChunkId(0), "a,b".to_string()),
+                (ChunkId(26), "a,b,c,d".to_string()),
+            ],
+            closed_before
+        );
+
+        let drained =
+            wal.drain_closed_chunks_while(|checkpoint| checkpoint == "a,b");
+        assert_eq!(vec![ChunkId(0)], drained);
+
+        let closed_after = wal
+            .closed_chunk_stats()
+            .into_iter()
+            .map(|stat| (stat.chunk_id, stat.log_state))
+            .collect::<Vec<_>>();
+        assert_eq!(vec![(ChunkId(26), "a,b,c,d".to_string())], closed_after);
 
         Ok(())
     }

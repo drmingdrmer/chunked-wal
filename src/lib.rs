@@ -25,6 +25,7 @@ pub use stat::ChunkStat;
 pub use stat::FlushLatencyPercentiles;
 pub use stat::FlushMetrics;
 pub use wal::ChunkedWal;
+pub use wal::ClosedChunkReader;
 pub use wal::FlushStat;
 pub use wal::callback::Callback;
 pub use wal::file_persisted::ChunkPersisted;
