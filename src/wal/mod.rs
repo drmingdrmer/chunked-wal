@@ -563,3 +563,510 @@ where W: WalTypes
         self.open.chunk.last_segment()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::io::Seek;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::mpsc::SyncSender;
+    use std::sync::mpsc::sync_channel;
+
+    use codeq::Encode;
+    use codeq::OffsetSize;
+
+    use crate::Chunk;
+    use crate::ChunkId;
+    use crate::ChunkPersisted;
+    use crate::ChunkPersistedFn;
+    use crate::ChunkedWal;
+    use crate::Config;
+    use crate::StateMachine;
+    use crate::WAL;
+    use crate::WALRecord;
+    use crate::WalTypes;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct TestWal;
+
+    impl WalTypes for TestWal {
+        type Action = String;
+        type Checkpoint = String;
+        type Callback = SyncSender<Result<(), io::Error>>;
+    }
+
+    #[derive(Debug, Default)]
+    struct TestStateMachine {
+        values: Vec<String>,
+    }
+
+    impl StateMachine<TestWal> for TestStateMachine {
+        type Error = io::Error;
+
+        fn apply(
+            &mut self,
+            record: &WALRecord<TestWal>,
+            _chunk_id: ChunkId,
+            _global_segment: crate::Segment,
+        ) -> Result<(), Self::Error> {
+            match record {
+                WALRecord::Action(v) => self.values.push(v.clone()),
+                WALRecord::Checkpoint(checkpoint) => {
+                    self.values = decode_checkpoint(checkpoint);
+                }
+            }
+
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> String {
+            encode_checkpoint(&self.values)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PersistedCall {
+        starting_offset: u64,
+        synced_offset: u64,
+        checkpoint: Option<String>,
+    }
+
+    fn encode_checkpoint(values: &[String]) -> String {
+        values.join(",")
+    }
+
+    fn decode_checkpoint(checkpoint: &str) -> Vec<String> {
+        if checkpoint.is_empty() {
+            return Vec::new();
+        }
+
+        checkpoint.split(',').map(str::to_string).collect()
+    }
+
+    fn callback(
+        calls: Arc<Mutex<Vec<PersistedCall>>>,
+    ) -> ChunkPersistedFn<TestWal> {
+        Arc::new(
+            move |persisted: ChunkPersisted,
+                  checkpoint: Option<Arc<String>>| {
+                calls.lock().unwrap().push(PersistedCall {
+                    starting_offset: persisted.starting_offset,
+                    synced_offset: persisted.synced_offset,
+                    checkpoint: checkpoint.as_deref().cloned(),
+                });
+            },
+        )
+    }
+
+    fn open_wal(
+        config: &Config,
+        calls: Arc<Mutex<Vec<PersistedCall>>>,
+    ) -> Result<(ChunkedWal<TestWal>, TestStateMachine), io::Error> {
+        let mut sm = TestStateMachine::default();
+        let wal = ChunkedWal::open(
+            Arc::new(config.clone()),
+            &mut sm,
+            callback(calls),
+        )?;
+
+        Ok((wal, sm))
+    }
+
+    fn append_action(
+        wal: &mut ChunkedWal<TestWal>,
+        sm: &mut TestStateMachine,
+        value: &str,
+    ) -> Result<crate::Segment, io::Error> {
+        let record = WALRecord::Action(value.to_string());
+        wal.append(&record)?;
+        let segment = wal.last_segment();
+        sm.apply(&record, wal.open.chunk.chunk_id(), segment)?;
+        wal.try_close_full_chunk(sm)?;
+        Ok(segment)
+    }
+
+    fn sync_flush(wal: &mut ChunkedWal<TestWal>) -> Result<(), io::Error> {
+        let (tx, rx) = sync_channel(1);
+        wal.send_pending(true, Some(tx))?;
+        rx.recv()
+            .map_err(|e| io::Error::other(format!("flush callback: {e}")))??;
+        wal.wait_worker_idle();
+        Ok(())
+    }
+
+    fn no_sync_flush(wal: &mut ChunkedWal<TestWal>) -> Result<(), io::Error> {
+        let (tx, rx) = sync_channel(1);
+        wal.send_pending(false, Some(tx))?;
+        rx.recv()
+            .map_err(|e| io::Error::other(format!("flush callback: {e}")))??;
+        wal.wait_worker_idle();
+        Ok(())
+    }
+
+    fn temp_config() -> (tempfile::TempDir, Config) {
+        let td = tempfile::tempdir().unwrap();
+        let config = Config::new(td.path().to_str().unwrap());
+        (td, config)
+    }
+
+    fn records_in_chunk(
+        config: &Config,
+        chunk_id: ChunkId,
+    ) -> Result<Vec<WALRecord<TestWal>>, io::Error> {
+        Chunk::<WALRecord<TestWal>>::dump(config, chunk_id)?
+            .into_iter()
+            .map(|res| res.map(|(_, record)| record))
+            .collect()
+    }
+
+    #[test]
+    fn test_open_append_flush_reopen() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            append_action(&mut wal, &mut sm, "a")?;
+            append_action(&mut wal, &mut sm, "b")?;
+            append_action(&mut wal, &mut sm, "c")?;
+            sync_flush(&mut wal)?;
+
+            assert_eq!(vec!["a", "b", "c"], sm.values);
+            assert!(wal.closed.is_empty());
+            assert_eq!(4, wal.open.chunk.records_count());
+        }
+
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (wal, sm) = open_wal(&config, calls)?;
+
+            assert_eq!(vec!["a", "b", "c"], sm.values);
+            assert!(wal.closed.is_empty());
+            assert_eq!(4, wal.open.chunk.records_count());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rotate_chunk_writes_checkpoint() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        append_action(&mut wal, &mut sm, "b")?;
+        append_action(&mut wal, &mut sm, "c")?;
+        sync_flush(&mut wal)?;
+
+        assert_eq!(1, wal.closed.len());
+        assert_eq!(
+            "a,b",
+            wal.closed.first_key_value().unwrap().1.state.as_ref()
+        );
+
+        let records = records_in_chunk(&config, wal.open.chunk.chunk_id())?;
+        assert_eq!(
+            vec![
+                WALRecord::Checkpoint("a,b".to_string()),
+                WALRecord::Action("c".to_string()),
+            ],
+            records
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_reuses_last_healthy_chunk() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let open_chunk_id = {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            for value in ["a", "b", "c", "d"] {
+                append_action(&mut wal, &mut sm, value)?;
+            }
+            sync_flush(&mut wal)?;
+
+            assert_eq!(2, wal.closed.len());
+            wal.open.chunk.chunk_id()
+        };
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (wal, sm) = open_wal(&config, calls)?;
+
+        assert_eq!(vec!["a", "b", "c", "d"], sm.values);
+        assert_eq!(2, wal.closed.len());
+        assert_eq!(open_chunk_id, wal.open.chunk.chunk_id());
+        assert_eq!(1, wal.open.chunk.records_count());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_truncates_incomplete_last_record() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+
+        let truncated_from = {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            append_action(&mut wal, &mut sm, "a")?;
+            append_action(&mut wal, &mut sm, "b")?;
+            let segment = append_action(&mut wal, &mut sm, "c")?;
+            sync_flush(&mut wal)?;
+
+            let chunk_id = wal.open.chunk.chunk_id();
+            let f = Chunk::<WALRecord<TestWal>>::open_chunk_file(
+                &config, chunk_id,
+            )?;
+            let damaged_len = segment.end().0 - chunk_id.offset() - 1;
+            f.set_len(damaged_len)?;
+            damaged_len
+        };
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (wal, sm) = open_wal(&config, calls)?;
+
+        assert_eq!(vec!["a", "b"], sm.values);
+        assert_eq!(1, wal.closed.len());
+        assert_eq!(
+            Some(truncated_from),
+            wal.closed.first_key_value().unwrap().1.chunk.truncated_file_size()
+        );
+        assert_eq!(
+            WALRecord::Checkpoint("a,b".to_string()),
+            wal.open.chunk.read_record(wal.open.chunk.last_segment())?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_truncates_trailing_zeroes() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+
+        let original_len = {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            append_action(&mut wal, &mut sm, "a")?;
+            append_action(&mut wal, &mut sm, "b")?;
+            sync_flush(&mut wal)?;
+
+            let chunk_id = wal.open.chunk.chunk_id();
+            let original_len = wal.open.chunk.global_end() - chunk_id.offset();
+            let mut f = Chunk::<WALRecord<TestWal>>::open_chunk_file(
+                &config, chunk_id,
+            )?;
+            f.seek(io::SeekFrom::Start(original_len))?;
+            f.write_all(&[0, 0, 0])?;
+            original_len
+        };
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (wal, sm) = open_wal(&config, calls)?;
+
+        assert_eq!(vec!["a", "b"], sm.values);
+        assert_eq!(1, wal.closed.len());
+        assert_eq!(
+            Some(original_len + 3),
+            wal.closed.first_key_value().unwrap().1.chunk.truncated_file_size()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_rejects_damaged_trailing_checkpoint() -> Result<(), io::Error>
+    {
+        let (_td, config) = temp_config();
+
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            append_action(&mut wal, &mut sm, "a")?;
+            append_action(&mut wal, &mut sm, "b")?;
+            sync_flush(&mut wal)?;
+
+            let chunk_id = wal.open.chunk.chunk_id();
+            let original_len = wal.open.chunk.global_end() - chunk_id.offset();
+            let mut f = Chunk::<WALRecord<TestWal>>::open_chunk_file(
+                &config, chunk_id,
+            )?;
+            let mut damaged = Vec::new();
+            WALRecord::<TestWal>::Checkpoint("bad".to_string())
+                .encode(&mut damaged)?;
+            *damaged.last_mut().unwrap() ^= 1;
+
+            f.seek(io::SeekFrom::Start(original_len))?;
+            f.write_all(&damaged)?;
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let err = match open_wal(&config, calls) {
+            Ok(_) => panic!("damaged checkpoint record must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("decode Record at offset"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_rejects_gap_between_chunks() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            append_action(&mut wal, &mut sm, "a")?;
+            let truncated_segment = append_action(&mut wal, &mut sm, "b")?;
+            append_action(&mut wal, &mut sm, "c")?;
+            sync_flush(&mut wal)?;
+
+            let chunk_id = *wal.closed.first_key_value().unwrap().0;
+            let f = Chunk::<WALRecord<TestWal>>::open_chunk_file(
+                &config, chunk_id,
+            )?;
+            let truncated_len = truncated_segment.end().0 - chunk_id.offset();
+            f.set_len(truncated_len - 1)?;
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let err = open_wal(&config, calls).expect_err("chunk gap must fail");
+
+        assert!(err.to_string().contains("Gap between chunks"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_on_chunk_persisted_called_on_recovery() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            for value in ["a", "b", "c", "d"] {
+                append_action(&mut wal, &mut sm, value)?;
+            }
+            sync_flush(&mut wal)?;
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (_wal, sm) = open_wal(&config, calls.clone())?;
+
+        assert_eq!(vec!["a", "b", "c", "d"], sm.values);
+        assert_eq!(
+            vec![None, Some("a,b".to_string()), Some("a,b,c,d".to_string()),],
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|call| call.checkpoint.clone())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_on_chunk_persisted_tracks_rotated_file() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls.clone())?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        append_action(&mut wal, &mut sm, "b")?;
+
+        let open_start = wal.open.chunk.global_start();
+        sync_flush(&mut wal)?;
+
+        assert!(calls.lock().unwrap().contains(&PersistedCall {
+            starting_offset: open_start,
+            synced_offset: wal.open.chunk.global_end(),
+            checkpoint: Some("a,b".to_string()),
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_lock_blocks_second_open_and_dump() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (wal, _sm) = open_wal(&config, calls.clone())?;
+
+        let err = ChunkedWal::<TestWal>::acquire_lock(&config)
+            .expect_err("second lock must fail");
+        assert_eq!(io::ErrorKind::WouldBlock, err.kind());
+
+        drop(wal);
+
+        let lock = ChunkedWal::<TestWal>::acquire_lock(&config)?;
+        let mut records = Vec::new();
+        ChunkedWal::<TestWal>::dump_records(
+            &config,
+            &lock,
+            |chunk_id, i, res| {
+                records.push((chunk_id, i, res.map(|(_, record)| record)?));
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(
+            vec![(ChunkId(0), 0, WALRecord::Checkpoint(String::new()))],
+            records
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_without_sync_writes_without_advancing_sync_id()
+    -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        append_action(&mut wal, &mut sm, "b")?;
+        no_sync_flush(&mut wal)?;
+
+        assert_eq!(
+            vec![(0, 0)],
+            wal.get_stat()?
+                .iter()
+                .map(|stat| stat.offset_sync_id())
+                .collect::<Vec<_>>()
+        );
+
+        sync_flush(&mut wal)?;
+
+        assert!(
+            wal.get_stat()?
+                .iter()
+                .any(|stat| stat.sync_id == wal.open.chunk.global_end())
+        );
+
+        Ok(())
+    }
+}
