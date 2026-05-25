@@ -340,3 +340,113 @@ fn write_all_vectored(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::Receiver;
+    use std::sync::mpsc::SyncSender;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use crate::WalTypes;
+    use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
+    use crate::wal::flush_request::SeqRequest;
+    use crate::wal::flush_request::WorkerRequest;
+    use crate::wal::flush_request::WriteRequest;
+    use crate::wal::flush_worker::FlushWorker;
+    use crate::wal::write_batch::WriteBatch;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct TestWal;
+
+    impl WalTypes for TestWal {
+        type Action = String;
+        type Checkpoint = String;
+        type Callback = SyncSender<Result<(), io::Error>>;
+    }
+
+    fn worker(
+        rx: Receiver<SeqRequest<TestWal>>,
+        flush_batch_wait: Duration,
+    ) -> FlushWorker<TestWal> {
+        FlushWorker {
+            rx,
+            files: Vec::new(),
+            metrics: Arc::new(AtomicFlushMetrics::default()),
+            flush_batch_wait,
+            flush_batch_max_items: 8,
+            done_seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn write_request(seq: u64) -> SeqRequest<TestWal> {
+        SeqRequest {
+            seq,
+            queued_at: Instant::now(),
+            req: WorkerRequest::Write(WriteRequest {
+                upto_offset: seq,
+                data: vec![seq as u8],
+                sync: false,
+                callback: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_sync_data_files_empty_file_list() -> Result<(), io::Error> {
+        let (_tx, rx) = sync_channel(1);
+        let mut worker = worker(rx, Duration::ZERO);
+
+        worker.sync_data_files(10)?;
+
+        assert!(worker.files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_write_batch_stops_at_deadline() {
+        let (_tx, rx) = sync_channel(1);
+        let worker = worker(rx, Duration::ZERO);
+        let mut batch = WriteBatch::new(8);
+        assert!(batch.push_seq_request(write_request(1)));
+
+        worker.collect_write_batch(&mut batch);
+
+        assert_eq!(1, batch.writes.len());
+        assert_eq!(1, batch.max_seq);
+        assert!(batch.last_non_flush.is_none());
+    }
+
+    #[test]
+    fn test_collect_write_batch_stops_at_non_write_request() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(SeqRequest {
+            seq: 2,
+            queued_at: Instant::now(),
+            req: WorkerRequest::RemoveChunks {
+                chunk_paths: vec!["obsolete".to_string()],
+            },
+        })
+        .unwrap();
+
+        let worker = worker(rx, Duration::from_secs(1));
+        let mut batch = WriteBatch::new(8);
+        assert!(batch.push_seq_request(write_request(1)));
+
+        worker.collect_write_batch(&mut batch);
+
+        assert_eq!(1, batch.writes.len());
+        assert_eq!(1, batch.max_seq);
+        let last = batch.last_non_flush.unwrap();
+        assert_eq!(2, last.seq);
+        assert!(matches!(
+            last.req,
+            WorkerRequest::RemoveChunks { chunk_paths }
+                if chunk_paths == vec!["obsolete".to_string()]
+        ));
+    }
+}

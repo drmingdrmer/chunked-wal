@@ -378,3 +378,160 @@ where Rec: Decode + 'static
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use crate::Chunk;
+    use crate::ChunkId;
+    use crate::Config;
+    use crate::Segment;
+
+    fn temp_file(bytes: &[u8]) -> Result<Arc<File>, io::Error> {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(bytes)?;
+        Ok(Arc::new(file))
+    }
+
+    fn config(truncate_incomplete_record: bool) -> Config {
+        let mut config = Config::new("unused");
+        config.truncate_incomplete_record = Some(truncate_incomplete_record);
+        config
+    }
+
+    #[test]
+    fn test_verify_trailing_zeros() -> Result<(), io::Error> {
+        let file = temp_file(&[0, 0, 0, 0])?;
+
+        assert!(Chunk::<String>::verify_trailing_zeros(
+            file.clone(),
+            2,
+            ChunkId(0)
+        )?);
+        assert!(Chunk::<String>::verify_trailing_zeros(
+            file.clone(),
+            4,
+            ChunkId(0)
+        )?);
+
+        let err =
+            Chunk::<String>::verify_trailing_zeros(file.clone(), 5, ChunkId(0))
+                .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert_eq!("Start offset 5 exceeds file size 4", err.to_string());
+
+        let file = temp_file(&[0, 0, 7, 0])?;
+        assert!(!Chunk::<String>::verify_trailing_zeros(
+            file,
+            0,
+            ChunkId(0)
+        )?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_trailing_zeros_accepts_large_zero_tail()
+    -> Result<(), io::Error> {
+        let file = temp_file(&vec![0; 64 * 1024 + 1])?;
+
+        assert!(Chunk::<String>::verify_trailing_zeros(file, 0, ChunkId(0))?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_record_error_for_unexpected_eof() -> Result<(), io::Error> {
+        let file = temp_file(&[])?;
+        let err = io::Error::new(io::ErrorKind::UnexpectedEof, "short record");
+
+        assert!(Chunk::<String>::handle_record_error(
+            err,
+            file.clone(),
+            0,
+            ChunkId(0),
+            &config(true)
+        )?);
+
+        let err = io::Error::new(io::ErrorKind::UnexpectedEof, "short record");
+        let got = Chunk::<String>::handle_record_error(
+            err,
+            file,
+            0,
+            ChunkId(0),
+            &config(false),
+        )
+        .unwrap_err();
+        assert_eq!(io::ErrorKind::UnexpectedEof, got.kind());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_record_error_for_trailing_zeros() -> Result<(), io::Error> {
+        let file = temp_file(&[0, 0])?;
+        let err = io::Error::new(io::ErrorKind::InvalidData, "bad record");
+
+        assert!(Chunk::<String>::handle_record_error(
+            err,
+            file.clone(),
+            0,
+            ChunkId(0),
+            &config(true)
+        )?);
+
+        let err = io::Error::new(io::ErrorKind::InvalidData, "bad record");
+        let got = Chunk::<String>::handle_record_error(
+            err,
+            file,
+            0,
+            ChunkId(0),
+            &config(false),
+        )
+        .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidData, got.kind());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_record_error_rejects_non_zero_tail() -> Result<(), io::Error>
+    {
+        let file = temp_file(&[0, 1])?;
+        let err = io::Error::new(io::ErrorKind::InvalidData, "bad record");
+
+        let got = Chunk::<String>::handle_record_error(
+            err,
+            file,
+            0,
+            ChunkId(0),
+            &config(true),
+        )
+        .unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidData, got.kind());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_record_adds_decode_context() -> Result<(), io::Error> {
+        let chunk = Chunk::<String> {
+            f: temp_file(&[0, 0, 0])?,
+            global_offsets: vec![12, 15],
+            truncated: None,
+            _p: Default::default(),
+        };
+
+        let err = chunk.read_record(Segment::new(12, 3)).unwrap_err();
+
+        assert_eq!(io::ErrorKind::UnexpectedEof, err.kind());
+        assert!(err.to_string().contains("decode Record"));
+        assert!(err.to_string().contains("ChunkId"));
+
+        Ok(())
+    }
+}

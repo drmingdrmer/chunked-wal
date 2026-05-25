@@ -688,6 +688,7 @@ mod tests {
     use crate::ChunkPersistedFn;
     use crate::ChunkedWal;
     use crate::Config;
+    use crate::Segment;
     use crate::StateMachine;
     use crate::WAL;
     use crate::WALRecord;
@@ -842,6 +843,7 @@ mod tests {
             assert_eq!(vec!["a", "b", "c"], sm.values);
             assert!(wal.closed.is_empty());
             assert_eq!(4, wal.open.chunk.records_count());
+            assert!(format!("{wal:?}").contains("ChunkedWal"));
         }
 
         {
@@ -853,6 +855,20 @@ mod tests {
             assert_eq!(4, wal.open.chunk.records_count());
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_chunk_ids_ignores_invalid_file_names() -> Result<(), io::Error>
+    {
+        let (_td, config) = temp_config();
+        std::fs::write(config.chunk_path(ChunkId(12)), [])?;
+        std::fs::write(format!("{}/not-a-chunk", config.dir), [])?;
+
+        let lock = ChunkedWal::<TestWal>::acquire_lock(&config)?;
+        let chunk_ids = ChunkedWal::<TestWal>::load_chunk_ids(&config, &lock)?;
+
+        assert_eq!(vec![ChunkId(12)], chunk_ids);
         Ok(())
     }
 
@@ -1152,6 +1168,11 @@ mod tests {
             WALRecord::Action("a".to_string()),
             wal.closed_chunk_reader().read_record(ChunkId(0), segment_a)?
         );
+
+        let err =
+            wal.load_record(&ChunkId(999), Segment::new(999, 1)).unwrap_err();
+        assert_eq!(io::ErrorKind::NotFound, err.kind());
+        assert!(err.to_string().contains("Chunk not found"));
 
         let mut dumped = Vec::new();
         wal.dump_loaded_records(|chunk_id, index, res| {
