@@ -11,14 +11,14 @@ use crate::chunk::Chunk;
 use crate::types::Segment;
 
 #[derive(Debug)]
-pub struct OpenChunk<Rec> {
+pub(crate) struct OpenChunk<Rec> {
     pending_data: Vec<u8>,
-    pub chunk: Chunk<Rec>,
+    pub(crate) chunk: Chunk<Rec>,
 }
 
 impl<Rec> OpenChunk<Rec> {
     /// Creates a new open chunk from an existing chunk.
-    pub fn new(chunk: Chunk<Rec>) -> Self {
+    pub(crate) fn new(chunk: Chunk<Rec>) -> Self {
         Self {
             pending_data: Vec::new(),
             chunk,
@@ -33,7 +33,7 @@ impl<Rec> OpenChunk<Rec> {
 impl<Rec> OpenChunk<Rec>
 where Rec: Encode
 {
-    pub fn create(
+    pub(crate) fn create(
         config: Arc<Config>,
         chunk_id: ChunkId,
         initial_record: Rec,
@@ -66,7 +66,10 @@ where Rec: Encode
         Ok(open)
     }
 
-    pub fn append_record(&mut self, rec: &Rec) -> Result<Segment, io::Error> {
+    pub(crate) fn append_record(
+        &mut self,
+        rec: &Rec,
+    ) -> Result<Segment, io::Error> {
         let size = rec.encode(&mut self.pending_data)?;
 
         self.chunk.append_record_size(size as u64);

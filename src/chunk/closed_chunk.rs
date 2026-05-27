@@ -6,17 +6,20 @@ use crate::chunk::Chunk;
 use crate::stat::ChunkStat;
 
 #[derive(Debug, Clone)]
-pub struct ClosedChunk<W>
+pub(crate) struct ClosedChunk<W>
 where W: WalTypes
 {
-    pub state: Arc<W::Checkpoint>,
-    pub chunk: Chunk<WALRecord<W>>,
+    pub(crate) state: Arc<W::Checkpoint>,
+    pub(crate) chunk: Chunk<WALRecord<W>>,
 }
 
 impl<W> ClosedChunk<W>
 where W: WalTypes
 {
-    pub fn new(chunk: Chunk<WALRecord<W>>, state: Arc<W::Checkpoint>) -> Self {
+    pub(crate) fn new(
+        chunk: Chunk<WALRecord<W>>,
+        state: Arc<W::Checkpoint>,
+    ) -> Self {
         Self { state, chunk }
     }
 }
@@ -24,7 +27,7 @@ where W: WalTypes
 impl<W> ClosedChunk<W>
 where W: WalTypes
 {
-    pub fn stat(&self) -> ChunkStat<W::Checkpoint> {
+    pub(crate) fn stat(&self) -> ChunkStat<W::Checkpoint> {
         ChunkStat {
             chunk_id: self.chunk.chunk_id(),
             records_count: self.chunk.records_count() as u64,

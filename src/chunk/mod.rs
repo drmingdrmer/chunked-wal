@@ -151,19 +151,6 @@ impl<Rec> Chunk<Rec> {
 impl<Rec> Chunk<Rec>
 where Rec: Decode + 'static
 {
-    /// Opens a chunk and loads its records.
-    ///
-    /// This function performs the following steps:
-    /// 1. Opens the chunk file
-    /// 2. Loads the records from the file
-    /// 3. Verifies the integrity of the records
-    pub fn open(
-        config: Arc<Config>,
-        chunk_id: ChunkId,
-    ) -> Result<(Self, Vec<Rec>), io::Error> {
-        Self::open_with_truncate(config, chunk_id, true)
-    }
-
     pub(crate) fn open_with_truncate(
         config: Arc<Config>,
         chunk_id: ChunkId,
@@ -378,6 +365,9 @@ where Rec: Decode + 'static
     /// without changing the file position. This avoids race conditions when
     /// multiple threads read from the same chunk concurrently.
     pub fn read_record(&self, segment: Segment) -> Result<Rec, io::Error> {
+        #[cfg(debug_assertions)]
+        self.debug_assert_valid_segment(segment);
+
         let offset = segment.offset().0 - self.global_start();
         let size = *segment.size() as usize;
 
@@ -387,6 +377,24 @@ where Rec: Decode + 'static
         Rec::decode(&buf[..]).context(|| {
             format!("decode Record {:?} in {}", segment, self.chunk_id())
         })
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_valid_segment(&self, segment: Segment) {
+        let start = segment.offset().0;
+        let end = segment.end().0;
+
+        let found = self
+            .global_offsets
+            .binary_search(&start)
+            .is_ok_and(|i| self.global_offsets.get(i + 1) == Some(&end));
+
+        debug_assert!(
+            found,
+            "segment {:?} is not in {}",
+            segment,
+            self.chunk_id()
+        );
     }
 }
 
@@ -412,6 +420,20 @@ mod tests {
         let mut config = Config::new("unused");
         config.truncate_incomplete_record = Some(truncate_incomplete_record);
         config
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "is not in ChunkId")]
+    fn test_read_record_rejects_unknown_segment() {
+        let chunk = Chunk::<String> {
+            f: temp_file(&[]).unwrap(),
+            global_offsets: vec![10, 20],
+            truncated: None,
+            _p: Default::default(),
+        };
+
+        let _ = chunk.read_record(Segment::new(11, 1));
     }
 
     #[test]

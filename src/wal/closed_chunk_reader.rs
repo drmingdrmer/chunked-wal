@@ -119,8 +119,9 @@ mod tests {
         let offset = open.chunk.f.metadata()?.len();
         open.chunk.f.write_all_at(&data, offset)?;
 
-        let (chunk, records) =
-            Chunk::<WALRecord<TestWal>>::open(config, chunk_id)?;
+        let (chunk, records) = Chunk::<WALRecord<TestWal>>::open_with_truncate(
+            config, chunk_id, true,
+        )?;
         assert_eq!(
             vec![WALRecord::Checkpoint(String::new()), action("val"),],
             records
