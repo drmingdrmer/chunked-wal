@@ -7,6 +7,7 @@ use std::io::Read;
 use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
+use codeq::Encode;
 use codeq::config::CodeqConfig;
 
 use crate::WalTypes;
@@ -66,7 +67,26 @@ where W: WalTypes
 {
     fn encode<Wt: io::Write>(&self, mut w: Wt) -> Result<usize, io::Error> {
         match self {
-            WALRecord::Action(action) => action.encode(&mut w),
+            WALRecord::Action(action) => {
+                let type_id = action.type_id().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "action encoding does not provide a leading type id",
+                    )
+                })?;
+
+                if type_id == CHECKPOINT_RECORD_TYPE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "action type id {} conflicts with checkpoint",
+                            CHECKPOINT_RECORD_TYPE
+                        ),
+                    ));
+                }
+
+                action.encode(&mut w)
+            }
             WALRecord::Checkpoint(checkpoint) => {
                 let mut n = 0;
                 let mut cw = Checksum::new_writer(&mut w);
@@ -95,9 +115,29 @@ where W: WalTypes
         let mut type_bytes = [0; 4];
         r.read_exact(&mut type_bytes)?;
 
-        if u32::from_be_bytes(type_bytes) != CHECKPOINT_RECORD_TYPE {
+        let type_id = u32::from_be_bytes(type_bytes);
+
+        if type_id != CHECKPOINT_RECORD_TYPE {
             let mut r = Cursor::new(type_bytes).chain(r);
-            return Ok(Self::Action(W::Action::decode(&mut r)?));
+            let action = W::Action::decode(&mut r)?;
+            let decoded_type_id = action.type_id().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decoded action does not provide a leading type id",
+                )
+            })?;
+
+            if decoded_type_id != type_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "action type id mismatch: encoded {}, decoded {}",
+                        type_id, decoded_type_id
+                    ),
+                ));
+            }
+
+            return Ok(Self::Action(action));
         }
 
         let mut cr = Checksum::new_reader(Cursor::new(type_bytes).chain(r));
@@ -111,6 +151,7 @@ where W: WalTypes
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::io;
     use std::sync::mpsc::SyncSender;
 
@@ -121,17 +162,69 @@ mod tests {
     use crate::wal::wal_record::CHECKPOINT_RECORD_TYPE;
     use crate::wal::wal_record::WALRecord;
 
+    const TEST_ACTION_TYPE: u32 = 1;
+
+    #[derive(Clone, PartialEq, Eq)]
+    struct TestAction(String);
+
+    impl fmt::Debug for TestAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Debug::fmt(&self.0, f)
+        }
+    }
+
+    impl fmt::Display for TestAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(&self.0, f)
+        }
+    }
+
+    impl Encode for TestAction {
+        fn encode<Wt: io::Write>(&self, mut w: Wt) -> Result<usize, io::Error> {
+            let mut n = TEST_ACTION_TYPE.encode(&mut w)?;
+            n += self.0.encode(&mut w)?;
+            Ok(n)
+        }
+
+        fn type_id(&self) -> Option<u32> {
+            Some(TEST_ACTION_TYPE)
+        }
+    }
+
+    impl Decode for TestAction {
+        fn decode<R: io::Read>(mut r: R) -> Result<Self, io::Error> {
+            let type_id = u32::decode(&mut r)?;
+            if type_id != TEST_ACTION_TYPE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected action type id {}", type_id),
+                ));
+            }
+
+            Ok(Self(String::decode(&mut r)?))
+        }
+    }
+
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
     struct TestWal;
 
     impl WalTypes for TestWal {
+        type Action = TestAction;
+        type Checkpoint = String;
+        type Callback = SyncSender<Result<(), io::Error>>;
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct NoTypeWal;
+
+    impl WalTypes for NoTypeWal {
         type Action = String;
         type Checkpoint = String;
         type Callback = SyncSender<Result<(), io::Error>>;
     }
 
     fn action(v: &str) -> WALRecord<TestWal> {
-        WALRecord::Action(v.to_string())
+        WALRecord::Action(TestAction(v.to_string()))
     }
 
     fn checkpoint(v: &str) -> WALRecord<TestWal> {
@@ -172,8 +265,19 @@ mod tests {
         let n = action("vote").encode(&mut got)?;
 
         assert_eq!(got.len(), n);
-        assert_eq!(vec![0, 0, 0, 4, 118, 111, 116, 101], got);
+        assert_eq!(vec![0, 0, 0, 1, 0, 0, 0, 4, 118, 111, 116, 101], got);
         Ok(())
+    }
+
+    #[test]
+    fn test_encode_action_requires_type_id() {
+        let mut got = Vec::new();
+        let rec = WALRecord::<NoTypeWal>::Action("vote".to_string());
+
+        let err = rec.encode(&mut got).unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert!(err.to_string().contains("does not provide"));
     }
 
     #[test]

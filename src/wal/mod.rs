@@ -679,6 +679,7 @@ mod tests {
     use std::sync::mpsc::SyncSender;
     use std::sync::mpsc::sync_channel;
 
+    use codeq::Decode;
     use codeq::Encode;
     use codeq::OffsetSize;
 
@@ -694,11 +695,42 @@ mod tests {
     use crate::WALRecord;
     use crate::WalTypes;
 
+    const TEST_ACTION_TYPE: u32 = 1;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestAction(String);
+
+    impl Encode for TestAction {
+        fn encode<Wt: io::Write>(&self, mut w: Wt) -> Result<usize, io::Error> {
+            let mut n = TEST_ACTION_TYPE.encode(&mut w)?;
+            n += self.0.encode(&mut w)?;
+            Ok(n)
+        }
+
+        fn type_id(&self) -> Option<u32> {
+            Some(TEST_ACTION_TYPE)
+        }
+    }
+
+    impl Decode for TestAction {
+        fn decode<R: io::Read>(mut r: R) -> Result<Self, io::Error> {
+            let type_id = u32::decode(&mut r)?;
+            if type_id != TEST_ACTION_TYPE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected action type id {}", type_id),
+                ));
+            }
+
+            Ok(Self(String::decode(&mut r)?))
+        }
+    }
+
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
     struct TestWal;
 
     impl WalTypes for TestWal {
-        type Action = String;
+        type Action = TestAction;
         type Checkpoint = String;
         type Callback = SyncSender<Result<(), io::Error>>;
     }
@@ -718,7 +750,7 @@ mod tests {
             _global_segment: crate::Segment,
         ) -> Result<(), Self::Error> {
             match record {
-                WALRecord::Action(v) => self.values.push(v.clone()),
+                WALRecord::Action(v) => self.values.push(v.0.clone()),
                 WALRecord::Checkpoint(checkpoint) => {
                     self.values = decode_checkpoint(checkpoint);
                 }
@@ -749,6 +781,10 @@ mod tests {
         }
 
         checkpoint.split(',').map(str::to_string).collect()
+    }
+
+    fn action(value: &str) -> WALRecord<TestWal> {
+        WALRecord::Action(TestAction(value.to_string()))
     }
 
     fn callback(
@@ -785,7 +821,7 @@ mod tests {
         sm: &mut TestStateMachine,
         value: &str,
     ) -> Result<crate::Segment, io::Error> {
-        let record = WALRecord::Action(value.to_string());
+        let record = action(value);
         wal.append(&record)?;
         let segment = wal.last_segment();
         sm.apply(&record, wal.open.chunk.chunk_id(), segment)?;
@@ -893,10 +929,7 @@ mod tests {
 
         let records = records_in_chunk(&config, wal.open.chunk.chunk_id())?;
         assert_eq!(
-            vec![
-                WALRecord::Checkpoint("a,b".to_string()),
-                WALRecord::Action("c".to_string()),
-            ],
+            vec![WALRecord::Checkpoint("a,b".to_string()), action("c"),],
             records
         );
 
@@ -1165,7 +1198,7 @@ mod tests {
         assert_eq!(None, wal.last_closed_chunk_truncated_file_size());
 
         assert_eq!(
-            WALRecord::Action("a".to_string()),
+            action("a"),
             wal.closed_chunk_reader().read_record(ChunkId(0), segment_a)?
         );
 
@@ -1183,10 +1216,10 @@ mod tests {
         assert_eq!(
             vec![
                 (ChunkId(0), 0, WALRecord::Checkpoint(String::new())),
-                (ChunkId(0), 1, WALRecord::Action("a".to_string())),
-                (ChunkId(0), 2, WALRecord::Action("b".to_string())),
+                (ChunkId(0), 1, action("a")),
+                (ChunkId(0), 2, action("b")),
                 (open_chunk_id, 0, WALRecord::Checkpoint("a,b".to_string())),
-                (open_chunk_id, 1, WALRecord::Action("c".to_string())),
+                (open_chunk_id, 1, action("c")),
             ],
             dumped
         );
@@ -1227,7 +1260,7 @@ mod tests {
         assert_eq!(
             vec![
                 (ChunkId(0), "a,b".to_string()),
-                (ChunkId(26), "a,b,c,d".to_string()),
+                (ChunkId(34), "a,b,c,d".to_string()),
             ],
             closed_before
         );
@@ -1241,7 +1274,7 @@ mod tests {
             .into_iter()
             .map(|stat| (stat.chunk_id, stat.log_state))
             .collect::<Vec<_>>();
-        assert_eq!(vec![(ChunkId(26), "a,b,c,d".to_string())], closed_after);
+        assert_eq!(vec![(ChunkId(34), "a,b,c,d".to_string())], closed_after);
 
         Ok(())
     }

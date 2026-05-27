@@ -45,6 +45,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc::SyncSender;
 
+    use codeq::Decode;
+    use codeq::Encode;
+
     use crate::Chunk;
     use crate::ChunkId;
     use crate::Config;
@@ -55,13 +58,48 @@ mod tests {
     use crate::types::Segment;
     use crate::wal::closed_chunk_reader::ClosedChunkReader;
 
+    const TEST_ACTION_TYPE: u32 = 1;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestAction(String);
+
+    impl Encode for TestAction {
+        fn encode<W: io::Write>(&self, mut w: W) -> Result<usize, io::Error> {
+            let mut n = TEST_ACTION_TYPE.encode(&mut w)?;
+            n += self.0.encode(&mut w)?;
+            Ok(n)
+        }
+
+        fn type_id(&self) -> Option<u32> {
+            Some(TEST_ACTION_TYPE)
+        }
+    }
+
+    impl Decode for TestAction {
+        fn decode<R: io::Read>(mut r: R) -> Result<Self, io::Error> {
+            let type_id = u32::decode(&mut r)?;
+            if type_id != TEST_ACTION_TYPE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected action type id {}", type_id),
+                ));
+            }
+
+            Ok(Self(String::decode(&mut r)?))
+        }
+    }
+
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
     struct TestWal;
 
     impl WalTypes for TestWal {
-        type Action = String;
+        type Action = TestAction;
         type Checkpoint = String;
         type Callback = SyncSender<Result<(), io::Error>>;
+    }
+
+    fn action(v: &str) -> WALRecord<TestWal> {
+        WALRecord::Action(TestAction(v.to_string()))
     }
 
     fn build_reader() -> Result<(ClosedChunkReader<TestWal>, Segment), io::Error>
@@ -76,7 +114,7 @@ mod tests {
             chunk_id,
             WALRecord::Checkpoint(String::new()),
         )?;
-        open.append_record(&WALRecord::Action("val".to_string()))?;
+        open.append_record(&action("val"))?;
         let data = open.take_pending_data();
         let offset = open.chunk.f.metadata()?.len();
         open.chunk.f.write_all_at(&data, offset)?;
@@ -84,10 +122,7 @@ mod tests {
         let (chunk, records) =
             Chunk::<WALRecord<TestWal>>::open(config, chunk_id)?;
         assert_eq!(
-            vec![
-                WALRecord::Checkpoint(String::new()),
-                WALRecord::Action("val".to_string()),
-            ],
+            vec![WALRecord::Checkpoint(String::new()), action("val"),],
             records
         );
 
@@ -105,10 +140,7 @@ mod tests {
     fn test_read_record() -> Result<(), io::Error> {
         let (reader, segment) = build_reader()?;
 
-        assert_eq!(
-            WALRecord::Action("val".to_string()),
-            reader.read_record(ChunkId(0), segment)?
-        );
+        assert_eq!(action("val"), reader.read_record(ChunkId(0), segment)?);
 
         Ok(())
     }
