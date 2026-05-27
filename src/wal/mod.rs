@@ -137,12 +137,16 @@ where W: WalTypes
         let mut closed = BTreeMap::new();
         let mut prev_end_offset = None;
         let mut prev_checkpoint = None;
+        let tail_chunk_id = chunk_ids.last().copied();
 
         for chunk_id in chunk_ids.iter().copied() {
             Self::ensure_consecutive_chunks(prev_end_offset, chunk_id)?;
 
-            let (chunk, records) =
-                Chunk::<WALRecord<W>>::open(config.clone(), chunk_id)?;
+            let (chunk, records) = Chunk::<WALRecord<W>>::open_with_truncate(
+                config.clone(),
+                chunk_id,
+                Some(chunk_id) == tail_chunk_id,
+            )?;
 
             on_chunk_persisted(
                 ChunkPersisted {
@@ -1081,11 +1085,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reopen_rejects_gap_between_chunks() -> Result<(), io::Error> {
+    fn test_reopen_rejects_damaged_non_tail_chunk_without_truncating()
+    -> Result<(), io::Error> {
         let (_td, mut config) = temp_config();
         config.chunk_max_records = Some(3);
 
-        {
+        let (chunk_id, damaged_len) = {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let (mut wal, mut sm) = open_wal(&config, calls)?;
 
@@ -1099,13 +1104,20 @@ mod tests {
                 &config, chunk_id,
             )?;
             let truncated_len = truncated_segment.end().0 - chunk_id.offset();
-            f.set_len(truncated_len - 1)?;
-        }
+            let damaged_len = truncated_len - 1;
+            f.set_len(damaged_len)?;
+            (chunk_id, damaged_len)
+        };
 
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let err = open_wal(&config, calls).expect_err("chunk gap must fail");
+        let err = open_wal(&config, calls)
+            .expect_err("damaged non-tail chunk must fail");
 
-        assert!(err.to_string().contains("Gap between chunks"));
+        assert!(err.to_string().contains("decode Record at offset"));
+
+        let f =
+            Chunk::<WALRecord<TestWal>>::open_chunk_file(&config, chunk_id)?;
+        assert_eq!(damaged_len, f.metadata()?.len());
 
         Ok(())
     }

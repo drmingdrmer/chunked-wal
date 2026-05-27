@@ -161,6 +161,14 @@ where Rec: Decode + 'static
         config: Arc<Config>,
         chunk_id: ChunkId,
     ) -> Result<(Self, Vec<Rec>), io::Error> {
+        Self::open_with_truncate(config, chunk_id, true)
+    }
+
+    pub(crate) fn open_with_truncate(
+        config: Arc<Config>,
+        chunk_id: ChunkId,
+        allow_truncate: bool,
+    ) -> Result<(Self, Vec<Rec>), io::Error> {
         let f = Self::open_chunk_file(&config, chunk_id)?;
         let arc_f = Arc::new(f);
         let file_size = arc_f.metadata()?.len();
@@ -184,6 +192,7 @@ where Rec: Decode + 'static
                         global_offset,
                         chunk_id,
                         &config,
+                        allow_truncate,
                     )?;
                     break;
                 }
@@ -219,6 +228,7 @@ where Rec: Decode + 'static
         global_offset: u64,
         chunk_id: ChunkId,
         config: &Config,
+        allow_truncate: bool,
     ) -> Result<bool, io::Error> {
         let at = format!(
             "at offset {} in chunk {}",
@@ -231,7 +241,8 @@ where Rec: Decode + 'static
             io_err.kind()
         );
 
-        let can_truncate = config.truncate_incomplete_record();
+        let can_truncate =
+            config.truncate_incomplete_record() && allow_truncate;
 
         // UnexpectedEof: incomplete record, can truncate if enabled
         if io_err.kind() == io::ErrorKind::UnexpectedEof {
@@ -454,7 +465,8 @@ mod tests {
             file.clone(),
             0,
             ChunkId(0),
-            &config(true)
+            &config(true),
+            true,
         )?);
 
         let err = io::Error::new(io::ErrorKind::UnexpectedEof, "short record");
@@ -464,6 +476,7 @@ mod tests {
             0,
             ChunkId(0),
             &config(false),
+            true,
         )
         .unwrap_err();
         assert_eq!(io::ErrorKind::UnexpectedEof, got.kind());
@@ -481,7 +494,8 @@ mod tests {
             file.clone(),
             0,
             ChunkId(0),
-            &config(true)
+            &config(true),
+            true,
         )?);
 
         let err = io::Error::new(io::ErrorKind::InvalidData, "bad record");
@@ -491,6 +505,7 @@ mod tests {
             0,
             ChunkId(0),
             &config(false),
+            true,
         )
         .unwrap_err();
         assert_eq!(io::ErrorKind::InvalidData, got.kind());
@@ -510,6 +525,7 @@ mod tests {
             0,
             ChunkId(0),
             &config(true),
+            true,
         )
         .unwrap_err();
         assert_eq!(io::ErrorKind::InvalidData, got.kind());
