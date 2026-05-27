@@ -15,8 +15,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
@@ -48,6 +46,7 @@ pub use crate::wal::file_persisted::ChunkPersistedFn;
 use crate::wal::flush_request::SeqRequest;
 use crate::wal::flush_request::WriteRequest;
 use crate::wal::flush_worker::FlushWorker;
+use crate::wal::flush_worker::WorkerState;
 
 /// Chunked write-ahead log implementation.
 ///
@@ -76,8 +75,8 @@ where W: WalTypes
     /// Only accessed by the main thread, so a plain `u64` suffices.
     sent_seq: u64,
 
-    /// Shared with `FlushWorker`; stores the highest completed seq.
-    done_seq: Arc<AtomicU64>,
+    /// Shared with `FlushWorker`; stores completion and failure state.
+    worker_state: Arc<WorkerState>,
 
     /// Shared with `FlushWorker`; stores aggregated flush metrics.
     flush_metrics: Arc<AtomicFlushMetrics>,
@@ -95,7 +94,7 @@ where W: WalTypes
             .field("open", &self.open)
             .field("closed", &self.closed)
             .field("sent_seq", &self.sent_seq)
-            .field("done_seq", &self.done_seq)
+            .field("done_seq", &self.worker_state.done_seq())
             .field("flush_metrics", &self.flush_metrics)
             .finish_non_exhaustive()
     }
@@ -243,14 +242,14 @@ where W: WalTypes
             ),
         );
 
-        let done_seq = Arc::new(AtomicU64::new(0));
+        let worker_state = Arc::new(WorkerState::new());
         let flush_metrics = Arc::new(AtomicFlushMetrics::default());
 
         let (flush_tx, rx) = std::sync::mpsc::sync_channel(1024);
         let worker = FlushWorker::new(
             rx,
             file_entry,
-            done_seq.clone(),
+            worker_state.clone(),
             flush_metrics.clone(),
             config.flush_batch_wait(),
             config.flush_batch_max_items(),
@@ -265,7 +264,7 @@ where W: WalTypes
             flush_tx,
             on_chunk_persisted,
             sent_seq: 0,
-            done_seq,
+            worker_state,
             flush_metrics,
             _dir_lock: dir_lock,
         }
@@ -459,12 +458,8 @@ where W: WalTypes
     }
 
     /// Block until the FlushWorker has processed all requests sent so far.
-    ///
-    /// Polls `done_seq` in a 1 ms sleep loop until it reaches `sent_seq`.
-    pub fn wait_worker_idle(&self) {
-        while self.done_seq.load(Ordering::Relaxed) < self.sent_seq {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+    pub fn wait_worker_idle(&self) -> Result<(), io::Error> {
+        self.worker_state.wait_for(self.sent_seq)
     }
 
     pub fn flush_metrics(&self) -> FlushMetrics {
@@ -834,7 +829,7 @@ mod tests {
         wal.send_pending(true, Some(tx))?;
         rx.recv()
             .map_err(|e| io::Error::other(format!("flush callback: {e}")))??;
-        wal.wait_worker_idle();
+        wal.wait_worker_idle()?;
         Ok(())
     }
 
@@ -843,7 +838,7 @@ mod tests {
         wal.send_pending(false, Some(tx))?;
         rx.recv()
             .map_err(|e| io::Error::other(format!("flush callback: {e}")))??;
-        wal.wait_worker_idle();
+        wal.wait_worker_idle()?;
         Ok(())
     }
 
@@ -1232,7 +1227,7 @@ mod tests {
         let path = config.chunk_path(ChunkId(0));
         assert!(std::path::Path::new(&path).exists());
         wal.send_remove_chunks(drained)?;
-        wal.wait_worker_idle();
+        wal.wait_worker_idle()?;
         assert!(!std::path::Path::new(&path).exists());
 
         Ok(())
@@ -1337,6 +1332,29 @@ mod tests {
                 .iter()
                 .any(|stat| stat.sync_id == wal.open.chunk.global_end())
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_worker_failure_wakes_waiter_and_fails_later_waits()
+    -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, _sm) = open_wal(&config, calls)?;
+
+        wal.send_remove_chunks(vec![ChunkId(999)])?;
+
+        let err = wal.wait_worker_idle().unwrap_err();
+        assert_eq!(io::ErrorKind::NotFound, err.kind());
+
+        let res = wal.send_remove_chunks(vec![ChunkId(999)]);
+        if let Err(err) = res {
+            assert_eq!(io::ErrorKind::Other, err.kind());
+        }
+
+        let err = wal.wait_worker_idle().unwrap_err();
+        assert_eq!(io::ErrorKind::NotFound, err.kind());
 
         Ok(())
     }

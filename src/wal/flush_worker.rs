@@ -4,8 +4,8 @@ use std::io::IoSlice;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
@@ -26,6 +26,79 @@ use crate::wal::flush_request::WorkerRequest;
 use crate::wal::queued_write::QueuedWrite;
 use crate::wal::write_batch::WriteBatch;
 
+#[derive(Debug)]
+pub(crate) enum WorkerStatus {
+    Running,
+    Failed(io::Error),
+}
+
+#[derive(Debug)]
+struct WorkerProgress {
+    done_seq: u64,
+    status: WorkerStatus,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorkerState {
+    progress: Mutex<WorkerProgress>,
+    changed: Condvar,
+}
+
+impl Default for WorkerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkerState {
+    pub(crate) fn new() -> Self {
+        Self {
+            progress: Mutex::new(WorkerProgress {
+                done_seq: 0,
+                status: WorkerStatus::Running,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn done_seq(&self) -> u64 {
+        self.progress.lock().unwrap().done_seq
+    }
+
+    pub(crate) fn complete(&self, seq: u64) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.done_seq = progress.done_seq.max(seq);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn fail(&self, err: io::Error) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.status = WorkerStatus::Failed(err);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn wait_for(&self, target_seq: u64) -> Result<(), io::Error> {
+        let mut progress = self.progress.lock().unwrap();
+        loop {
+            if progress.done_seq >= target_seq {
+                return Ok(());
+            }
+
+            status_error(&progress.status)?;
+            progress = self.changed.wait(progress).unwrap();
+        }
+    }
+}
+
+fn status_error(status: &WorkerStatus) -> Result<(), io::Error> {
+    match status {
+        WorkerStatus::Running => Ok(()),
+        WorkerStatus::Failed(err) => {
+            Err(io::Error::new(err.kind(), err.to_string()))
+        }
+    }
+}
+
 pub(crate) struct FlushWorker<W>
 where W: WalTypes
 {
@@ -34,13 +107,7 @@ where W: WalTypes
     metrics: Arc<AtomicFlushMetrics>,
     flush_batch_wait: Duration,
     flush_batch_max_items: usize,
-    /// The highest completed request sequence number.
-    ///
-    /// Updated (with `Relaxed` ordering) after processing each request or
-    /// batch. The main thread polls this to implement `wait_worker_idle()`.
-    /// `Relaxed` is sufficient because this value is only a progress counter;
-    /// request side effects provide their own synchronization.
-    done_seq: Arc<AtomicU64>,
+    worker_state: Arc<WorkerState>,
 }
 
 impl<W> FlushWorker<W>
@@ -59,7 +126,7 @@ where W: WalTypes
     pub(crate) fn new(
         rx: Receiver<SeqRequest<W>>,
         file_entry: FileEntry<W>,
-        done_seq: Arc<AtomicU64>,
+        worker_state: Arc<WorkerState>,
         metrics: Arc<AtomicFlushMetrics>,
         flush_batch_wait: Duration,
         flush_batch_max_items: usize,
@@ -70,18 +137,18 @@ where W: WalTypes
             metrics,
             flush_batch_wait,
             flush_batch_max_items,
-            done_seq,
+            worker_state,
         }
     }
 
-    fn run(self) {
-        let res = self.run_inner();
-        if let Err(e) = res {
+    fn run(mut self) {
+        if let Err(e) = self.run_inner() {
             log::error!("FlushWorker failed: {}", e);
+            self.worker_state.fail(e);
         }
     }
 
-    fn run_inner(mut self) -> Result<(), io::Error> {
+    fn run_inner(&mut self) -> Result<(), io::Error> {
         loop {
             // Write requests should be batched to maximize throughput.
             let mut batch = WriteBatch::new(self.flush_batch_max_items);
@@ -99,7 +166,7 @@ where W: WalTypes
                     unreachable!("non-write request must be stored");
                 };
                 self.handle_non_flush_request(req)?;
-                self.done_seq.store(seq, Ordering::Relaxed);
+                self.worker_state.complete(seq);
                 continue;
             }
 
@@ -119,27 +186,30 @@ where W: WalTypes
                 }
 
                 let write_start = Instant::now();
-                write_batch_vectored(&mut last_file, &batch.writes)?;
+                let write_res =
+                    write_batch_vectored(&mut last_file, &batch.writes);
                 batch_metrics.record_write_time(write_start);
 
                 let need_sync = batch.writes.iter().any(|w| w.write.sync);
 
-                let sync_result = if need_sync {
-                    let upto_offset =
-                        batch.writes.last().unwrap().write.upto_offset;
-                    let sync_start = Instant::now();
-                    let res = self.sync_data_files(upto_offset);
-                    batch_metrics.record_sync_time(sync_start);
-                    if let Err(ref e) = res {
-                        log::error!(
-                            "Failed to flush upto offset {}: {}",
-                            upto_offset,
-                            e
-                        );
+                let sync_result = match write_res {
+                    Ok(()) if need_sync => {
+                        let upto_offset =
+                            batch.writes.last().unwrap().write.upto_offset;
+                        let sync_start = Instant::now();
+                        let res = self.sync_data_files(upto_offset);
+                        batch_metrics.record_sync_time(sync_start);
+                        if let Err(ref e) = res {
+                            log::error!(
+                                "Failed to flush upto offset {}: {}",
+                                upto_offset,
+                                e
+                            );
+                        }
+                        res
                     }
-                    res
-                } else {
-                    Ok(())
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(e),
                 };
 
                 batch_metrics.record_batch_time(batch_start);
@@ -169,6 +239,8 @@ where W: WalTypes
                 }
             }
 
+            sync_result?;
+
             // Handle the last non-flush request
             if let Some(SeqRequest {
                 seq: nf_seq,
@@ -180,7 +252,7 @@ where W: WalTypes
                 max_seq = max_seq.max(nf_seq);
             }
 
-            self.done_seq.store(max_seq, Ordering::Relaxed);
+            self.worker_state.complete(max_seq);
         }
     }
 
@@ -228,12 +300,14 @@ where W: WalTypes
                 let stat = self
                     .files
                     .iter()
-                    .map(|f| FlushStat {
-                        starting_offset: f.starting_offset,
-                        sync_id: f.sync_id,
-                        ino: f.f.metadata().unwrap().ino(),
+                    .map(|f| {
+                        Ok(FlushStat {
+                            starting_offset: f.starting_offset,
+                            sync_id: f.sync_id,
+                            ino: f.f.metadata()?.ino(),
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, io::Error>>()?;
                 let _ = tx.send(stat);
             }
             WorkerRequest::RemoveChunks { chunk_paths } => {
@@ -345,7 +419,6 @@ fn write_all_vectored(
 mod tests {
     use std::io;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc::Receiver;
     use std::sync::mpsc::SyncSender;
     use std::sync::mpsc::sync_channel;
@@ -358,6 +431,7 @@ mod tests {
     use crate::wal::flush_request::WorkerRequest;
     use crate::wal::flush_request::WriteRequest;
     use crate::wal::flush_worker::FlushWorker;
+    use crate::wal::flush_worker::WorkerState;
     use crate::wal::write_batch::WriteBatch;
 
     #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -379,7 +453,7 @@ mod tests {
             metrics: Arc::new(AtomicFlushMetrics::default()),
             flush_batch_wait,
             flush_batch_max_items: 8,
-            done_seq: Arc::new(AtomicU64::new(0)),
+            worker_state: Arc::new(WorkerState::new()),
         }
     }
 
@@ -394,6 +468,30 @@ mod tests {
                 callback: None,
             }),
         }
+    }
+
+    #[test]
+    fn test_worker_state_waits_for_completion() -> Result<(), io::Error> {
+        let state = WorkerState::new();
+
+        state.complete(3);
+
+        assert_eq!(3, state.done_seq());
+        state.wait_for(2)?;
+        state.wait_for(3)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_worker_state_wait_returns_failure() {
+        let state = WorkerState::new();
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "no write");
+
+        state.fail(err);
+
+        let got = state.wait_for(1).unwrap_err();
+        assert_eq!(io::ErrorKind::PermissionDenied, got.kind());
+        assert_eq!("no write", got.to_string());
     }
 
     #[test]
