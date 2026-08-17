@@ -6,6 +6,7 @@ pub(crate) mod atomic_flush_metrics;
 pub(crate) mod batch_metrics;
 mod closed_chunk_reader;
 pub(crate) mod file_entry;
+mod flush_client;
 pub(crate) mod flush_request;
 pub(crate) mod flush_worker;
 pub(crate) mod queued_write;
@@ -16,7 +17,6 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
-use std::time::Instant;
 
 pub use closed_chunk_reader::ClosedChunkReader;
 use codeq::OffsetSize;
@@ -43,7 +43,7 @@ use crate::wal::file_entry::FileEntry;
 use crate::wal::file_persisted::ChunkPersisted;
 use crate::wal::file_persisted::ChunkPersistedCallback;
 pub use crate::wal::file_persisted::ChunkPersistedFn;
-use crate::wal::flush_request::SeqRequest;
+use crate::wal::flush_client::FlushClient;
 use crate::wal::flush_request::WriteRequest;
 use crate::wal::flush_worker::FlushWorker;
 use crate::wal::flush_worker::WorkerState;
@@ -64,19 +64,12 @@ where W: WalTypes
     ///
     /// Each write operation may carry its own callback, defined by
     /// `W::Callback`.
-    flush_tx: SyncSender<SeqRequest<W>>,
+    flush_client: FlushClient<W>,
 
     /// File-level callback invoked after fsync.
     ///
     /// This callback is called once for each synced chunk file.
     on_chunk_persisted: ChunkPersistedFn<W>,
-
-    /// The next sequence number to assign. Incremented on each `send_request`.
-    /// Only accessed by the main thread, so a plain `u64` suffices.
-    sent_seq: u64,
-
-    /// Shared with `FlushWorker`; stores completion and failure state.
-    worker_state: Arc<WorkerState>,
 
     /// Shared with `FlushWorker`; stores aggregated flush metrics.
     flush_metrics: Arc<AtomicFlushMetrics>,
@@ -93,8 +86,8 @@ where W: WalTypes
             .field("config", &self.config)
             .field("open", &self.open)
             .field("closed", &self.closed)
-            .field("sent_seq", &self.sent_seq)
-            .field("done_seq", &self.worker_state.done_seq())
+            .field("sent_seq", &self.flush_client.sent_seq())
+            .field("done_seq", &self.flush_client.done_seq())
             .field("flush_metrics", &self.flush_metrics)
             .finish_non_exhaustive()
     }
@@ -261,14 +254,14 @@ where W: WalTypes
 
         worker.spawn();
 
+        let flush_client = FlushClient::new(flush_tx, worker_state);
+
         Self {
             config,
             open,
             closed,
-            flush_tx,
+            flush_client,
             on_chunk_persisted,
-            sent_seq: 0,
-            worker_state,
             flush_metrics,
             _dir_lock: dir_lock,
         }
@@ -449,21 +442,12 @@ where W: WalTypes
     /// Wraps a `WorkerRequest` with an auto-incrementing seq and sends it to
     /// the FlushWorker.
     fn send_request(&mut self, req: WorkerRequest<W>) -> Result<(), io::Error> {
-        self.sent_seq += 1;
-        self.flush_tx
-            .send(SeqRequest {
-                seq: self.sent_seq,
-                queued_at: Instant::now(),
-                req,
-            })
-            .map_err(|e| {
-                io::Error::other(format!("Failed to send request: {}", e))
-            })
+        self.flush_client.send(req)
     }
 
     /// Block until the FlushWorker has processed all requests sent so far.
     pub fn wait_worker_idle(&self) -> Result<(), io::Error> {
-        self.worker_state.wait_for(self.sent_seq)
+        self.flush_client.wait_idle()
     }
 
     pub fn flush_metrics(&self) -> FlushMetrics {
