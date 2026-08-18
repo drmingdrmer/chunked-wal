@@ -116,8 +116,9 @@ mod tests {
         )?;
         open.append_record(&action("val"))?;
         let data = open.take_pending_data();
-        let offset = open.chunk.f.metadata()?.len();
-        open.chunk.f.write_all_at(&data, offset)?;
+        let f = open.chunk.file()?;
+        let offset = f.metadata()?.len();
+        f.write_all_at(&data, offset)?;
 
         let (chunk, records) = Chunk::<WALRecord<TestWal>>::open_with_truncate(
             config, chunk_id, true,

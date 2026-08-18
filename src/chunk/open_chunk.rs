@@ -8,6 +8,7 @@ use codeq::Encode;
 use crate::ChunkId;
 use crate::Config;
 use crate::chunk::Chunk;
+use crate::chunk::file_slot::FileSlot;
 use crate::types::Segment;
 
 #[derive(Debug)]
@@ -33,23 +34,20 @@ impl<Rec> OpenChunk<Rec> {
 impl<Rec> OpenChunk<Rec>
 where Rec: Encode
 {
-    pub(crate) fn create(
-        config: Arc<Config>,
+    /// Constructs the in-memory state of a new chunk without creating its
+    /// file.
+    ///
+    /// Returns the open chunk together with the encoded bytes of its leading
+    /// record. The chunk's file slot is left pending; the caller is
+    /// responsible for creating the file, writing the leading bytes at its
+    /// start, and publishing the handle via the slot.
+    pub(crate) fn prepare(
         chunk_id: ChunkId,
         initial_record: Rec,
-    ) -> Result<Self, io::Error> {
-        let path = config.chunk_path(chunk_id);
-        let f = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(path)?;
-
-        let record_offsets = vec![*chunk_id];
-
+    ) -> Result<(Self, Vec<u8>), io::Error> {
         let chunk = Chunk {
-            f: Arc::new(f),
-            global_offsets: record_offsets,
+            f: FileSlot::pending(),
+            global_offsets: vec![*chunk_id],
             truncated: None,
             _p: Default::default(),
         };
@@ -60,8 +58,28 @@ where Rec: Encode
         };
 
         open.append_record(&initial_record)?;
-        open.chunk.f.write_all(&open.pending_data)?;
-        open.pending_data.clear();
+        let leading_bytes = open.take_pending_data();
+
+        Ok((open, leading_bytes))
+    }
+
+    /// Creates a new chunk file and its in-memory state synchronously.
+    pub(crate) fn create(
+        config: Arc<Config>,
+        chunk_id: ChunkId,
+        initial_record: Rec,
+    ) -> Result<Self, io::Error> {
+        let (open, leading_bytes) = Self::prepare(chunk_id, initial_record)?;
+
+        let path = config.chunk_path(chunk_id);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(path)?;
+        f.write_all(&leading_bytes)?;
+
+        open.chunk.f.set(Arc::new(f));
 
         Ok(open)
     }

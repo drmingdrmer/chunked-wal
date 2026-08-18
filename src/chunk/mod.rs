@@ -11,6 +11,7 @@
 
 pub mod chunk_id;
 pub mod closed_chunk;
+pub(crate) mod file_slot;
 pub mod open_chunk;
 pub mod record_iterator;
 
@@ -30,6 +31,7 @@ use record_iterator::RecordIterator;
 
 use crate::Config;
 use crate::chunk::chunk_id::ChunkId;
+use crate::chunk::file_slot::FileSlot;
 use crate::num::format_pad9_u64;
 use crate::types::Segment;
 
@@ -41,8 +43,12 @@ use crate::types::Segment;
 /// - Metadata about its position in the complete log
 #[derive(Debug, Clone)]
 pub struct Chunk<Rec> {
-    /// File handle for the chunk's persistent storage
-    pub(crate) f: Arc<File>,
+    /// File handle for the chunk's persistent storage.
+    ///
+    /// The handle may be published after the chunk's in-memory state is
+    /// constructed: a chunk file can be created by another thread than the
+    /// one that constructs the chunk. See [`FileSlot`].
+    pub(crate) f: FileSlot,
 
     /// The global offsets of each record in the file.
     ///
@@ -133,6 +139,16 @@ impl<Rec> Chunk<Rec> {
         self.global_offsets.push(last + size);
     }
 
+    /// Returns this chunk's file handle, waiting for the flush worker to
+    /// create the file if it does not exist yet.
+    ///
+    /// The wait is bounded: the worker creates the file after processing a
+    /// finite prefix of its FIFO queue. If the worker failed before creating
+    /// the file, this returns the worker's error.
+    pub(crate) fn file(&self) -> Result<Arc<File>, io::Error> {
+        self.f.wait()
+    }
+
     pub fn open_chunk_file(
         config: &Config,
         chunk_id: ChunkId,
@@ -196,7 +212,7 @@ where Rec: Decode + 'static
         };
 
         let chunk = Self {
-            f: arc_f,
+            f: FileSlot::ready(arc_f),
             global_offsets: record_offsets,
             truncated,
             _p: Default::default(),
@@ -364,6 +380,11 @@ where Rec: Decode + 'static
     /// Uses `pread` (positional read) to atomically read from a specific offset
     /// without changing the file position. This avoids race conditions when
     /// multiple threads read from the same chunk concurrently.
+    ///
+    /// If the chunk's file has not been created yet (the flush worker
+    /// materializes a rolled chunk's file only after the predecessor chunk
+    /// is durable), this blocks briefly until the file exists. The wait is
+    /// bounded by the worker processing a finite prefix of its FIFO queue.
     pub fn read_record(&self, segment: Segment) -> Result<Rec, io::Error> {
         #[cfg(debug_assertions)]
         self.debug_assert_valid_segment(segment);
@@ -372,7 +393,7 @@ where Rec: Decode + 'static
         let size = *segment.size() as usize;
 
         let mut buf = vec![0u8; size];
-        self.f.read_exact_at(&mut buf, offset)?;
+        self.file()?.read_exact_at(&mut buf, offset)?;
 
         Rec::decode(&buf[..]).context(|| {
             format!("decode Record {:?} in {}", segment, self.chunk_id())
@@ -409,6 +430,7 @@ mod tests {
     use crate::ChunkId;
     use crate::Config;
     use crate::Segment;
+    use crate::chunk::file_slot::FileSlot;
 
     fn temp_file(bytes: &[u8]) -> Result<Arc<File>, io::Error> {
         let mut file = tempfile::tempfile()?;
@@ -427,7 +449,7 @@ mod tests {
     #[should_panic(expected = "is not in ChunkId")]
     fn test_read_record_rejects_unknown_segment() {
         let chunk = Chunk::<String> {
-            f: temp_file(&[]).unwrap(),
+            f: FileSlot::ready(temp_file(&[]).unwrap()),
             global_offsets: vec![10, 20],
             truncated: None,
             _p: Default::default(),
@@ -558,7 +580,7 @@ mod tests {
     #[test]
     fn test_read_record_adds_decode_context() -> Result<(), io::Error> {
         let chunk = Chunk::<String> {
-            f: temp_file(&[0, 0, 0])?,
+            f: FileSlot::ready(temp_file(&[0, 0, 0])?),
             global_offsets: vec![12, 15],
             truncated: None,
             _p: Default::default(),

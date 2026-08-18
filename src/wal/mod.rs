@@ -150,7 +150,7 @@ where W: WalTypes
 
             on_chunk_persisted(
                 ChunkPersisted {
-                    file: chunk.f.clone(),
+                    file: chunk.file()?,
                     starting_offset: chunk.global_start(),
                     synced_offset: chunk.global_end(),
                 },
@@ -235,7 +235,10 @@ where W: WalTypes
             closed.iter().last().map(|(_, c)| c.state.clone());
 
         let offset = open.chunk.global_start();
-        let f = open.chunk.f.clone();
+        let f =
+            open.chunk.f.get().expect(
+                "the open chunk file is materialized when the WAL opens",
+            );
 
         let file_entry = FileEntry::new(
             offset,
@@ -604,7 +607,7 @@ where W: WalTypes
 
         self.send_request(WorkerRequest::AppendFile(FileEntry::new(
             offset.0,
-            self.open.chunk.f.clone(),
+            self.open.chunk.file()?,
             ChunkPersistedCallback::new(
                 self.on_chunk_persisted.clone(),
                 Some(checkpoint.clone()),
