@@ -30,6 +30,8 @@ enum SlotState {
     Pending,
     /// The file exists and the handle is available.
     Ready(Arc<File>),
+    /// The file will never be created; holds the causing error.
+    Failed(io::ErrorKind, String),
 }
 
 impl FileSlot {
@@ -63,6 +65,18 @@ impl FileSlot {
         self.inner.filled.notify_all();
     }
 
+    /// Marks the slot as permanently unavailable and wakes all waiting
+    /// readers, which then observe the error instead of blocking forever.
+    ///
+    /// Has no effect if the handle was already published.
+    pub(crate) fn fail(&self, err: &io::Error) {
+        let mut state = self.inner.state.lock().unwrap();
+        if matches!(*state, SlotState::Pending) {
+            *state = SlotState::Failed(err.kind(), err.to_string());
+            self.inner.filled.notify_all();
+        }
+    }
+
     /// Returns the file handle if it is already available.
     pub(crate) fn get(&self) -> Option<Arc<File>> {
         match &*self.inner.state.lock().unwrap() {
@@ -74,12 +88,20 @@ impl FileSlot {
     /// Blocks until the file handle is available and returns it.
     ///
     /// The wait is bounded: the flush worker creates the file after
-    /// processing a finite prefix of its FIFO queue.
+    /// processing a finite prefix of its FIFO queue. If the worker fails
+    /// before creating the file, the slot is poisoned and this returns the
+    /// worker's error.
     pub(crate) fn wait(&self) -> Result<Arc<File>, io::Error> {
         let mut state = self.inner.state.lock().unwrap();
         loop {
             match &*state {
                 SlotState::Ready(f) => return Ok(f.clone()),
+                SlotState::Failed(kind, msg) => {
+                    return Err(io::Error::new(
+                        *kind,
+                        format!("chunk file was never created: {}", msg),
+                    ));
+                }
                 SlotState::Pending => {
                     state = self.inner.filled.wait(state).unwrap();
                 }
@@ -95,6 +117,11 @@ impl fmt::Debug for FileSlot {
             SlotState::Ready(file) => {
                 f.debug_tuple("FileSlot").field(file).finish()
             }
+            SlotState::Failed(kind, msg) => f
+                .debug_struct("FileSlot")
+                .field("failed_kind", kind)
+                .field("failed_error", msg)
+                .finish(),
         }
     }
 }
@@ -132,6 +159,28 @@ mod tests {
 
         let got = waiter.join().unwrap()?;
         assert!(Arc::ptr_eq(&f, &got));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_failed_slot_returns_error() {
+        let slot = FileSlot::pending();
+        slot.fail(&io::Error::new(io::ErrorKind::StorageFull, "no space"));
+
+        let err = slot.wait().unwrap_err();
+        assert_eq!(io::ErrorKind::StorageFull, err.kind());
+        assert!(err.to_string().contains("no space"));
+        assert!(slot.get().is_none());
+    }
+
+    #[test]
+    fn test_fail_does_not_override_ready() -> Result<(), io::Error> {
+        let f = Arc::new(tempfile::tempfile()?);
+        let slot = FileSlot::ready(f.clone());
+        slot.fail(&io::Error::other("late failure"));
+
+        assert!(Arc::ptr_eq(&f, &slot.wait()?));
 
         Ok(())
     }

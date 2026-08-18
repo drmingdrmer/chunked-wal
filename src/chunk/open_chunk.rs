@@ -1,6 +1,4 @@
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Write;
 use std::sync::Arc;
 
 use codeq::Encode;
@@ -8,6 +6,7 @@ use codeq::Encode;
 use crate::ChunkId;
 use crate::Config;
 use crate::chunk::Chunk;
+use crate::chunk::create_chunk_file;
 use crate::chunk::file_slot::FileSlot;
 use crate::types::Segment;
 
@@ -72,12 +71,7 @@ where Rec: Encode
         let (open, leading_bytes) = Self::prepare(chunk_id, initial_record)?;
 
         let path = config.chunk_path(chunk_id);
-        let mut f = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(path)?;
-        f.write_all(&leading_bytes)?;
+        let f = create_chunk_file(&path, &leading_bytes)?;
 
         open.chunk.f.set(Arc::new(f));
 

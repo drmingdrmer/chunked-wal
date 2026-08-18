@@ -15,12 +15,14 @@ use log::debug;
 use log::info;
 
 use crate::WalTypes;
+use crate::chunk::create_chunk_file;
 use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
 use crate::wal::batch_metrics::BatchMetrics;
 use crate::wal::callback::Callback;
 use crate::wal::file_entry::FileEntry;
 use crate::wal::file_persisted::ChunkPersisted;
 use crate::wal::flush_request::FlushStat;
+use crate::wal::flush_request::RollRequest;
 use crate::wal::flush_request::SeqRequest;
 use crate::wal::flush_request::WorkerRequest;
 use crate::wal::queued_write::QueuedWrite;
@@ -144,6 +146,17 @@ where W: WalTypes
     fn run(mut self) {
         if let Err(e) = self.run_inner() {
             log::error!("FlushWorker failed: {}", e);
+
+            // Readers may be blocked waiting for a chunk file that this
+            // worker will never create; poison the file slots of all queued
+            // roll requests so those readers observe the failure instead of
+            // blocking forever.
+            while let Ok(seq_req) = self.rx.try_recv() {
+                if let WorkerRequest::Roll(roll) = seq_req.req {
+                    roll.file_slot.fail(&e);
+                }
+            }
+
             self.worker_state.fail(e);
         }
     }
@@ -289,9 +302,9 @@ where W: WalTypes
         req: WorkerRequest<W>,
     ) -> Result<(), io::Error> {
         match req {
-            WorkerRequest::AppendFile(file_entry) => {
-                info!("FlushWorker: AppendFile: {}", file_entry);
-                self.files.push(file_entry);
+            WorkerRequest::Roll(roll) => {
+                info!("FlushWorker: {:?}", roll);
+                self.handle_roll(roll)?;
             }
             WorkerRequest::Write(_) => {
                 unreachable!("Write request should be handled in run()");
@@ -319,6 +332,47 @@ where W: WalTypes
         }
 
         Ok(())
+    }
+
+    /// Materializes the file of a newly opened chunk.
+    ///
+    /// The predecessor chunk must be fully durable before the successor file
+    /// becomes visible on disk: recovery classifies a chunk as closed purely
+    /// by the existence of a successor file, assumes closed chunks are fully
+    /// synced, and repairs a torn tail only on the last chunk. All writes to
+    /// the predecessor precede this request in the FIFO queue, so they have
+    /// already been written at this point; syncing the tracked files then
+    /// makes the predecessor durable, and only after that is the successor
+    /// file created.
+    fn handle_roll(&mut self, roll: RollRequest<W>) -> Result<(), io::Error> {
+        let unsynced =
+            self.files.last().is_some_and(|f| f.sync_id < roll.starting_offset);
+        if unsynced {
+            let res = self.sync_data_files(roll.starting_offset);
+            if let Err(e) = res {
+                roll.file_slot.fail(&e);
+                return Err(e);
+            }
+        }
+
+        match create_chunk_file(&roll.path, &roll.leading_bytes) {
+            Ok(f) => {
+                let f = Arc::new(f);
+                roll.file_slot.set(f.clone());
+                self.files.push(FileEntry::new(
+                    roll.starting_offset,
+                    f,
+                    roll.on_persisted,
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                // Poison the slot so readers waiting for this chunk's file
+                // observe the failure instead of blocking forever.
+                roll.file_slot.fail(&e);
+                Err(e)
+            }
+        }
     }
 
     pub fn sync_data_files(&mut self, offset: u64) -> Result<(), io::Error> {

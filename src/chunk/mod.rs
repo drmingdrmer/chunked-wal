@@ -18,6 +18,7 @@ pub mod record_iterator;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
@@ -162,6 +163,28 @@ impl<Rec> Chunk<Rec> {
 
         Ok(f)
     }
+}
+
+/// Creates a new chunk file at `path` and writes the encoded leading record
+/// at its start.
+///
+/// Fails if the file already exists: a chunk file is created exactly once,
+/// and an existing file indicates a bug or a leftover from a previous
+/// instance.
+pub(crate) fn create_chunk_file(
+    path: &str,
+    leading_bytes: &[u8],
+) -> Result<File, io::Error> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(path)
+        .context(|| format!("create chunk file {}", path))?;
+
+    f.write_all(leading_bytes)?;
+
+    Ok(f)
 }
 
 impl<Rec> Chunk<Rec>

@@ -2,8 +2,10 @@ use std::fmt;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
+use crate::ChunkId;
 use crate::WalTypes;
-use crate::wal::file_entry::FileEntry;
+use crate::chunk::file_slot::FileSlot;
+use crate::wal::file_persisted::ChunkPersistedCallback;
 
 /// A `WorkerRequest` tagged with a monotonically increasing sequence number.
 ///
@@ -67,11 +69,57 @@ impl FlushStat {
     }
 }
 
+/// Asks the flush worker to materialize the file of a newly opened chunk.
+///
+/// When a full chunk is closed, the caller constructs the successor chunk's
+/// in-memory state immediately but does not create its file. The worker,
+/// processing its FIFO queue in order, first finishes and syncs all writes
+/// belonging to the predecessor chunk, and only then creates the successor
+/// file and writes its leading record. This guarantees by construction that
+/// a chunk file never exists on disk while its predecessor is not fully
+/// durable, which is what recovery relies on: it classifies a chunk as
+/// closed purely by the existence of a successor file, and repairs a torn
+/// tail only on the last chunk.
+pub(crate) struct RollRequest<W>
+where W: WalTypes
+{
+    /// Global offset at which the new chunk starts; equals the end offset of
+    /// the predecessor chunk.
+    pub(crate) starting_offset: u64,
+
+    /// Filesystem path of the new chunk file.
+    pub(crate) path: String,
+
+    /// Encoded leading checkpoint record, written at the start of the new
+    /// file when it is created.
+    pub(crate) leading_bytes: Vec<u8>,
+
+    /// Slot shared with the new chunk's in-memory state; the worker
+    /// publishes the created file handle into it.
+    pub(crate) file_slot: FileSlot,
+
+    /// Persisted callback for the new chunk file.
+    pub(crate) on_persisted: ChunkPersistedCallback<W>,
+}
+
+impl<W> fmt::Debug for RollRequest<W>
+where W: WalTypes
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RollRequest")
+            .field("starting_offset", &ChunkId(self.starting_offset))
+            .field("path", &self.path)
+            .field("leading_bytes_len", &self.leading_bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) enum WorkerRequest<W>
 where W: WalTypes
 {
-    /// Append a new file that will be need to be sync.
-    AppendFile(FileEntry<W>),
+    /// Materialize the file of a newly opened chunk, after making its
+    /// predecessor durable.
+    Roll(RollRequest<W>),
 
     /// Remove chunks that have been purged.
     ///
@@ -92,8 +140,8 @@ where W: WalTypes
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WorkerRequest::AppendFile(file_entry) => {
-                f.debug_tuple("AppendFile").field(file_entry).finish()
+            WorkerRequest::Roll(roll) => {
+                f.debug_tuple("Roll").field(roll).finish()
             }
             WorkerRequest::RemoveChunks { chunk_paths } => f
                 .debug_struct("RemoveChunks")
@@ -118,10 +166,11 @@ mod tests {
     use std::time::Instant;
 
     use crate::WalTypes;
-    use crate::wal::file_entry::FileEntry;
+    use crate::chunk::file_slot::FileSlot;
     use crate::wal::file_persisted::ChunkPersistedCallback;
     use crate::wal::file_persisted::ChunkPersistedFn;
     use crate::wal::flush_request::FlushStat;
+    use crate::wal::flush_request::RollRequest;
     use crate::wal::flush_request::SeqRequest;
     use crate::wal::flush_request::WorkerRequest;
     use crate::wal::flush_request::WriteRequest;
@@ -198,15 +247,17 @@ mod tests {
         let stat = WorkerRequest::<TestWal>::GetFlushStat { tx };
         assert_eq!("GetFlushStat { .. }", format!("{stat:?}"));
 
-        let file = Arc::new(tempfile::tempfile()?);
-        let append = WorkerRequest::AppendFile(FileEntry::<TestWal>::new(
-            12,
-            file,
-            callback(),
-        ));
+        let roll = WorkerRequest::<TestWal>::Roll(RollRequest {
+            starting_offset: 12,
+            path: "some/chunk".to_string(),
+            leading_bytes: vec![1, 2, 3],
+            file_slot: FileSlot::pending(),
+            on_persisted: callback(),
+        });
         assert_eq!(
-            "AppendFile(FileEntry { starting_offset: ChunkId(12), sync_id: 0 })",
-            format!("{append:?}")
+            "Roll(RollRequest { starting_offset: ChunkId(12), \
+             path: \"some/chunk\", leading_bytes_len: 3, .. })",
+            format!("{roll:?}")
         );
 
         Ok(())

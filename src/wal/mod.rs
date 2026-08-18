@@ -43,6 +43,7 @@ use crate::wal::file_entry::FileEntry;
 use crate::wal::file_persisted::ChunkPersisted;
 use crate::wal::file_persisted::ChunkPersistedCallback;
 pub use crate::wal::file_persisted::ChunkPersistedFn;
+use crate::wal::flush_request::RollRequest;
 use crate::wal::flush_request::SeqRequest;
 use crate::wal::flush_request::WriteRequest;
 use crate::wal::flush_worker::FlushWorker;
@@ -410,6 +411,14 @@ where W: WalTypes
             Result<(Segment, WALRecord<W>), io::Error>,
         ) -> Result<(), io::Error>,
     {
+        // Chunk files are materialized asynchronously by the flush worker;
+        // wait until every chunk to dump exists on disk before opening it
+        // by path.
+        for closed in self.closed.values() {
+            closed.chunk.file()?;
+        }
+        self.open.chunk.file()?;
+
         let closed = self.closed.keys().copied();
         let chunk_ids = closed.chain([self.open.chunk.chunk_id()]);
 
@@ -545,8 +554,16 @@ where W: WalTypes
                 >= self.config.chunk_max_size()
     }
 
-    /// Attempts to close the current chunk if it's full and creates a new open
+    /// Attempts to close the current chunk if it's full and opens a new
     /// chunk.
+    ///
+    /// The new chunk's in-memory state is constructed here, but its file is
+    /// created later by the flush worker (see `WorkerRequest::Roll`), after
+    /// all remaining writes of the closed chunk have been written and
+    /// synced. This guarantees that a successor chunk file never exists on
+    /// disk before its predecessor is fully durable, which recovery relies
+    /// on: it classifies a chunk as closed purely by the existence of a
+    /// successor file and repairs a torn tail only on the last chunk.
     ///
     /// # Arguments
     ///
@@ -559,7 +576,9 @@ where W: WalTypes
     ///
     /// # Errors
     ///
-    /// Returns an IO error if chunk operations fail
+    /// Returns an IO error if chunk operations fail. Errors from creating
+    /// the new chunk file itself (e.g. no space left) surface through the
+    /// flush worker, like write errors do.
     pub fn try_close_full_chunk<SM>(
         &mut self,
         state_machine: &SM,
@@ -571,25 +590,21 @@ where W: WalTypes
             return Ok(None);
         }
 
-        let config = self.config.clone();
         let offset = self.open.chunk.last_segment().end();
+        let chunk_id = ChunkId(offset.0);
 
         info!(
             "Closing full chunk: {}, open new: {}",
             self.open.chunk.chunk_id(),
-            ChunkId(offset.0)
+            chunk_id
         );
 
         let checkpoint = state_machine.checkpoint();
 
-        let new_open = {
-            let chunk_id = ChunkId(offset.0);
-            OpenChunk::create(
-                config,
-                chunk_id,
-                WALRecord::Checkpoint(checkpoint.clone()),
-            )?
-        };
+        let (new_open, leading_bytes) = OpenChunk::prepare(
+            chunk_id,
+            WALRecord::Checkpoint(checkpoint.clone()),
+        )?;
 
         let mut old_open = std::mem::replace(&mut self.open, new_open);
 
@@ -605,14 +620,16 @@ where W: WalTypes
 
         let checkpoint = Arc::new(checkpoint);
 
-        self.send_request(WorkerRequest::AppendFile(FileEntry::new(
-            offset.0,
-            self.open.chunk.file()?,
-            ChunkPersistedCallback::new(
+        self.send_request(WorkerRequest::Roll(RollRequest {
+            starting_offset: offset.0,
+            path: self.config.chunk_path(chunk_id),
+            leading_bytes,
+            file_slot: self.open.chunk.f.clone(),
+            on_persisted: ChunkPersistedCallback::new(
                 self.on_chunk_persisted.clone(),
                 Some(checkpoint.clone()),
             ),
-        )))?;
+        }))?;
 
         let chunk = old_open.chunk;
         let closed_id = chunk.chunk_id();
