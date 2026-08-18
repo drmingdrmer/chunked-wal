@@ -693,10 +693,13 @@ mod tests {
     use std::io;
     use std::io::Seek;
     use std::io::Write;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::mpsc::Receiver;
     use std::sync::mpsc::SyncSender;
     use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
 
     use codeq::Decode;
     use codeq::Encode;
@@ -819,6 +822,30 @@ mod tests {
                 });
             },
         )
+    }
+
+    /// A persisted-callback that blocks the flush worker the first time it
+    /// fires: it reports the call through `entered` and then waits for
+    /// `release`. Since the callback runs on the worker thread right after
+    /// an fsync, this holds the worker at the exact point where a chunk has
+    /// just become durable, before any later queued request is processed.
+    fn gated_callback(
+        entered: SyncSender<PersistedCall>,
+        release: Receiver<()>,
+    ) -> ChunkPersistedFn<TestWal> {
+        let gate = Mutex::new(Some((entered, release)));
+        Arc::new(move |persisted, checkpoint| {
+            if let Some((entered, release)) = gate.lock().unwrap().take() {
+                entered
+                    .send(PersistedCall {
+                        starting_offset: persisted.starting_offset,
+                        synced_offset: persisted.synced_offset,
+                        checkpoint: checkpoint.as_deref().cloned(),
+                    })
+                    .unwrap();
+                release.recv().unwrap();
+            }
+        })
     }
 
     fn open_wal(
@@ -1387,6 +1414,190 @@ mod tests {
 
         let err = wal.wait_worker_idle().unwrap_err();
         assert_eq!(io::ErrorKind::NotFound, err.kind());
+
+        Ok(())
+    }
+
+    /// The successor chunk file must never exist on disk before the closed
+    /// chunk is fully durable.
+    ///
+    /// The gated callback blocks the worker at the moment the closed chunk
+    /// has just been synced — after that point the worker's next step is to
+    /// create the successor file, and before that point the worker cannot
+    /// have created it. Asserting the file's absence while the worker is
+    /// held there covers the whole window deterministically.
+    #[test]
+    fn test_successor_file_absent_until_predecessor_durable()
+    -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+
+        let mut sm = TestStateMachine::default();
+        let mut wal = ChunkedWal::open(
+            Arc::new(config.clone()),
+            &mut sm,
+            gated_callback(entered_tx, release_rx),
+        )?;
+
+        // Fill the open chunk; the records stay in pending data, nothing
+        // has been handed to the worker yet.
+        for value in ["a", "b"] {
+            let record = action(value);
+            wal.append(&record)?;
+            sm.apply(&record, wal.open_chunk_id(), wal.last_segment())?;
+        }
+
+        let closed_checkpoint =
+            wal.try_close_full_chunk(&sm)?.expect("chunk is full");
+        assert_eq!("a,b", closed_checkpoint);
+
+        let successor_id = wal.open_chunk_id();
+        let successor_path = config.chunk_path(successor_id);
+
+        // Closing no longer creates the successor file on the caller
+        // thread.
+        assert!(!Path::new(&successor_path).exists());
+
+        // The worker is now held inside the persisted callback: the closed
+        // chunk is durable at its full length, and the successor file has
+        // not been created yet.
+        let sealed = entered_rx.recv().unwrap();
+        assert_eq!(0, sealed.starting_offset);
+        assert_eq!(successor_id.offset(), sealed.synced_offset);
+        assert!(!Path::new(&successor_path).exists());
+
+        release_tx.send(()).unwrap();
+        wal.wait_worker_idle()?;
+
+        // Released, the worker materializes the successor with its leading
+        // checkpoint record.
+        assert!(Path::new(&successor_path).exists());
+        assert_eq!(
+            vec![WALRecord::Checkpoint("a,b".to_string())],
+            records_in_chunk(&config, successor_id)?
+        );
+
+        Ok(())
+    }
+
+    /// Simulates a crash inside the chunk-close window: the close decision
+    /// was made, but the flush worker never finished persisting the closed
+    /// chunk nor processed the roll request. On disk this leaves the chunk
+    /// with a torn tail and no successor file, because the successor is
+    /// only created after the predecessor is durable. The torn chunk is
+    /// therefore still the tail chunk and normal torn-tail truncation heals
+    /// it on reopen; the state that made recovery refuse to open (torn
+    /// non-tail chunk with a successor present) can no longer be produced
+    /// by a crash at close.
+    #[test]
+    fn test_reopen_heals_crash_in_close_window() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+
+        let last_segment = {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            append_action(&mut wal, &mut sm, "a")?;
+            append_action(&mut wal, &mut sm, "b")?;
+            let segment = append_action(&mut wal, &mut sm, "c")?;
+            sync_flush(&mut wal)?;
+            segment
+        };
+
+        // Tear the tail record: the bytes past the last sync are lost in
+        // the crash. The successor the close would have rolled to must not
+        // exist.
+        let chunk_id = ChunkId(0);
+        let successor_path = config.chunk_path(ChunkId(last_segment.end().0));
+        assert!(!Path::new(&successor_path).exists());
+        let f =
+            Chunk::<WALRecord<TestWal>>::open_chunk_file(&config, chunk_id)?;
+        f.set_len(last_segment.end().0 - 1)?;
+        drop(f);
+
+        // Reopen: the torn chunk is the tail chunk, so truncation repairs
+        // it and the WAL keeps working.
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+            assert_eq!(vec!["a", "b"], sm.values);
+
+            append_action(&mut wal, &mut sm, "d")?;
+            sync_flush(&mut wal)?;
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (_wal, sm) = open_wal(&config, calls)?;
+        assert_eq!(vec!["a", "b", "d"], sm.values);
+
+        Ok(())
+    }
+
+    /// A reader that hits a chunk whose file the worker has not created yet
+    /// blocks until the file is materialized, then succeeds; no error
+    /// surfaces.
+    #[test]
+    fn test_read_blocks_until_chunk_file_materialized() -> Result<(), io::Error>
+    {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(2);
+
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+
+        let mut sm = TestStateMachine::default();
+        let mut wal = ChunkedWal::open(
+            Arc::new(config.clone()),
+            &mut sm,
+            gated_callback(entered_tx, release_rx),
+        )?;
+
+        // First close: chunk 0 is sealed and its successor is constructed
+        // in memory only. The worker then blocks in the persisted callback
+        // right after making chunk 0 durable, before creating the
+        // successor's file.
+        let record = action("a");
+        wal.append(&record)?;
+        sm.apply(&record, wal.open_chunk_id(), wal.last_segment())?;
+        wal.try_close_full_chunk(&sm)?.expect("chunk 0 is full");
+        let successor_id = wal.open_chunk_id();
+
+        entered_rx.recv().unwrap();
+
+        // Second close: the still file-less successor becomes a closed
+        // chunk, readable through load_record.
+        let record = action("b");
+        wal.append(&record)?;
+        sm.apply(&record, successor_id, wal.last_segment())?;
+        wal.try_close_full_chunk(&sm)?.expect("successor is full");
+
+        let leading_segment =
+            wal.closed.get(&successor_id).unwrap().chunk.record_segment(0);
+
+        std::thread::scope(|scope| -> Result<(), io::Error> {
+            let wal_ref = &wal;
+            let reader = scope.spawn(move || {
+                wal_ref.load_record(&successor_id, leading_segment)
+            });
+
+            // The reader blocks: the chunk's file does not exist yet and
+            // the worker is still held at the gate.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!reader.is_finished());
+            assert!(!Path::new(&config.chunk_path(successor_id)).exists());
+
+            release_tx.send(()).unwrap();
+
+            let record = reader.join().unwrap()?;
+            assert_eq!(WALRecord::Checkpoint("a".to_string()), record);
+            Ok(())
+        })?;
+
+        wal.wait_worker_idle()?;
 
         Ok(())
     }
