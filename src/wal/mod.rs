@@ -552,6 +552,8 @@ where W: WalTypes
             return Ok(None);
         }
 
+        self.send_pending(true, None)?;
+
         let config = self.config.clone();
         let offset = self.open.chunk.last_segment().end();
 
@@ -562,38 +564,30 @@ where W: WalTypes
         );
 
         let checkpoint = state_machine.checkpoint();
+        let checkpoint = Arc::new(checkpoint);
 
+        // New open chunk without initial checkpoint record. The checkpoint will
+        // be added after the file is persisted.
         let new_open = {
             let chunk_id = ChunkId(offset.0);
-            OpenChunk::create_with_initial_record(
-                config,
-                chunk_id,
-                WALRecord::Checkpoint(checkpoint.clone()),
-            )?
+            OpenChunk::<WALRecord<W>>::create_empty(config, chunk_id)?
         };
-
-        let mut old_open = std::mem::replace(&mut self.open, new_open);
-
-        let prev_pending_data = old_open.take_pending_data();
-        if !prev_pending_data.is_empty() {
-            self.send_request(WorkerRequest::Write(WriteRequest {
-                upto_offset: offset.0,
-                data: prev_pending_data,
-                sync: true,
-                callback: None,
-            }))?;
-        }
-
-        let checkpoint = Arc::new(checkpoint);
 
         self.send_request(WorkerRequest::AppendFile(FileEntry::new(
             offset.0,
-            self.open.chunk.f.clone(),
+            new_open.chunk.f.clone(),
             ChunkPersistedCallback::new(
                 self.on_chunk_persisted.clone(),
                 Some(checkpoint.clone()),
             ),
         )))?;
+
+        // install the new open
+        let old_open = std::mem::replace(&mut self.open, new_open);
+
+        // Add the initial checkpoint record.
+        self.append(&WALRecord::Checkpoint(checkpoint.as_ref().clone()))?;
+        self.send_pending(false, None)?;
 
         let chunk = old_open.chunk;
         let closed_id = chunk.chunk_id();

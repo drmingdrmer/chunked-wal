@@ -34,7 +34,7 @@ impl<Rec> OpenChunk<Rec> {
 impl<Rec> OpenChunk<Rec>
 where Rec: Encode
 {
-    pub(crate) fn create(
+    pub(crate) fn create_empty(
         config: Arc<Config>,
         chunk_id: ChunkId,
     ) -> Result<Self, io::Error> {
@@ -73,7 +73,7 @@ where Rec: Encode
         chunk_id: ChunkId,
         initial_record: Rec,
     ) -> Result<Self, io::Error> {
-        let mut open = Self::create(config, chunk_id)?;
+        let mut open = Self::create_empty(config, chunk_id)?;
 
         open.append_record(&initial_record)?;
         open.chunk.f.write_all(&open.pending_data)?;
