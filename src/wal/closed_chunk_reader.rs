@@ -109,11 +109,17 @@ mod tests {
         let config = Arc::new(config);
         let chunk_id = ChunkId(0);
 
-        let mut open = OpenChunk::<WALRecord<TestWal>>::create(
-            config.clone(),
-            chunk_id,
-            WALRecord::Checkpoint(String::new()),
+        let initial = OpenChunk::<WALRecord<TestWal>>::encode_initial_record(
+            &WALRecord::Checkpoint(String::new()),
         )?;
+        std::fs::write(config.chunk_path(chunk_id), &initial)?;
+        let file =
+            Chunk::<WALRecord<TestWal>>::open_chunk_file(&config, chunk_id)?;
+        let mut open = OpenChunk::from_created_file(
+            Arc::new(file),
+            chunk_id,
+            initial.len() as u64,
+        );
         open.append_record(&action("val"))?;
         let data = open.take_pending_data();
         let offset = open.chunk.f.metadata()?.len();

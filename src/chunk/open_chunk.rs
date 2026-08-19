@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
@@ -28,42 +29,53 @@ impl<Rec> OpenChunk<Rec> {
     pub(crate) fn take_pending_data(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_data)
     }
+
+    pub(crate) fn from_created_file(
+        file: Arc<File>,
+        chunk_id: ChunkId,
+        initial_record_size: u64,
+    ) -> Self {
+        let start = chunk_id.offset();
+        let chunk = Chunk {
+            f: file,
+            global_offsets: vec![start, start + initial_record_size],
+            truncated: None,
+            _p: Default::default(),
+        };
+        Self::new(chunk)
+    }
 }
 
 impl<Rec> OpenChunk<Rec>
 where Rec: Encode
 {
+    pub(crate) fn encode_initial_record(
+        initial_record: &Rec,
+    ) -> Result<Vec<u8>, io::Error> {
+        let mut data = Vec::new();
+        initial_record.encode(&mut data)?;
+        Ok(data)
+    }
+
     pub(crate) fn create(
         config: Arc<Config>,
         chunk_id: ChunkId,
         initial_record: Rec,
     ) -> Result<Self, io::Error> {
+        let data = Self::encode_initial_record(&initial_record)?;
+        let record_size = data.len() as u64;
         let path = config.chunk_path(chunk_id);
-        let f = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .read(true)
             .create_new(true)
             .open(path)?;
-
-        let record_offsets = vec![*chunk_id];
-
-        let chunk = Chunk {
-            f: Arc::new(f),
-            global_offsets: record_offsets,
-            truncated: None,
-            _p: Default::default(),
-        };
-
-        let mut open = Self {
-            pending_data: Vec::new(),
-            chunk,
-        };
-
-        open.append_record(&initial_record)?;
-        open.chunk.f.write_all(&open.pending_data)?;
-        open.pending_data.clear();
-
-        Ok(open)
+        file.write_all(&data)?;
+        Ok(Self::from_created_file(
+            Arc::new(file),
+            chunk_id,
+            record_size,
+        ))
     }
 
     pub(crate) fn append_record(
