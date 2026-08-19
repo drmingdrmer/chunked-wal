@@ -125,7 +125,7 @@ where W: WalTypes
 
     pub(crate) fn new(
         rx: Receiver<SeqRequest<W>>,
-        file_entry: FileEntry<W>,
+        file_entry: Option<FileEntry<W>>,
         worker_state: Arc<WorkerState>,
         metrics: Arc<AtomicFlushMetrics>,
         flush_batch_wait: Duration,
@@ -133,7 +133,7 @@ where W: WalTypes
     ) -> Self {
         Self {
             rx,
-            files: vec![file_entry],
+            files: file_entry.into_iter().collect(),
             metrics,
             flush_batch_wait,
             flush_batch_max_items,

@@ -245,7 +245,7 @@ where W: WalTypes
         let (flush_tx, rx) = std::sync::mpsc::sync_channel(1024);
         let worker = FlushWorker::new(
             rx,
-            file_entry,
+            Some(file_entry),
             worker_state.clone(),
             flush_metrics.clone(),
             config.flush_batch_wait(),
