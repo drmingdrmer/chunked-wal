@@ -1,13 +1,10 @@
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Write;
 use std::sync::Arc;
 
 use codeq::Encode;
 
 use crate::ChunkId;
-use crate::Config;
 use crate::chunk::Chunk;
 use crate::types::Segment;
 
@@ -55,27 +52,6 @@ where Rec: Encode
         let mut data = Vec::new();
         initial_record.encode(&mut data)?;
         Ok(data)
-    }
-
-    pub(crate) fn create(
-        config: Arc<Config>,
-        chunk_id: ChunkId,
-        initial_record: Rec,
-    ) -> Result<Self, io::Error> {
-        let data = Self::encode_initial_record(&initial_record)?;
-        let record_size = data.len() as u64;
-        let path = config.chunk_path(chunk_id);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(path)?;
-        file.write_all(&data)?;
-        Ok(Self::from_created_file(
-            Arc::new(file),
-            chunk_id,
-            record_size,
-        ))
     }
 
     pub(crate) fn append_record(

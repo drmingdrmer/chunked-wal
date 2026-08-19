@@ -10,7 +10,6 @@ use std::time::Instant;
 use crate::ChunkId;
 use crate::Config;
 use crate::WalTypes;
-use crate::wal::file_entry::FileEntry;
 use crate::wal::file_persisted::ChunkPersistedCallback;
 
 pub(crate) struct CreateChunkRequest<W>
@@ -123,9 +122,6 @@ where W: WalTypes
     /// Create, initialize, and begin tracking a new chunk file.
     CreateChunk(CreateChunkRequest<W>),
 
-    /// Append a new file that will be need to be sync.
-    AppendFile(FileEntry<W>),
-
     /// Remove chunks that have been purged.
     ///
     /// This job must be done in FlushWorker to ensure it is after the
@@ -147,9 +143,6 @@ where W: WalTypes
         match self {
             WorkerRequest::CreateChunk(request) => {
                 f.debug_tuple("CreateChunk").field(request).finish()
-            }
-            WorkerRequest::AppendFile(file_entry) => {
-                f.debug_tuple("AppendFile").field(file_entry).finish()
             }
             WorkerRequest::RemoveChunks { chunk_paths } => f
                 .debug_struct("RemoveChunks")
@@ -176,7 +169,6 @@ mod tests {
     use crate::ChunkId;
     use crate::Config;
     use crate::WalTypes;
-    use crate::wal::file_entry::FileEntry;
     use crate::wal::file_persisted::ChunkPersistedCallback;
     use crate::wal::file_persisted::ChunkPersistedFn;
     use crate::wal::flush_request::CreateChunkRequest;
@@ -256,17 +248,6 @@ mod tests {
         let (tx, _rx) = sync_channel(1);
         let stat = WorkerRequest::<TestWal>::GetFlushStat { tx };
         assert_eq!("GetFlushStat { .. }", format!("{stat:?}"));
-
-        let file = Arc::new(tempfile::tempfile()?);
-        let append = WorkerRequest::AppendFile(FileEntry::<TestWal>::new(
-            12,
-            file,
-            callback(),
-        ));
-        assert_eq!(
-            "AppendFile(FileEntry { starting_offset: ChunkId(12), sync_id: 0 })",
-            format!("{append:?}")
-        );
 
         let config = Arc::new(Config::new("wal-dir"));
         let (create, _rx) = CreateChunkRequest::<TestWal>::new(

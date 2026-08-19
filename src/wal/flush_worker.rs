@@ -304,10 +304,6 @@ where W: WalTypes
             WorkerRequest::CreateChunk(request) => {
                 self.handle_create_chunk(request)?;
             }
-            WorkerRequest::AppendFile(file_entry) => {
-                info!("FlushWorker: AppendFile: {}", file_entry);
-                self.files.push(file_entry);
-            }
             WorkerRequest::Write(_) => {
                 unreachable!("Write request should be handled in run()");
             }

@@ -404,7 +404,6 @@ where W: WalTypes
             if fn_str == WalLock::LOCK_FILE_NAME {
                 continue;
             }
-
             let res = Config::parse_chunk_file_name(&fn_str);
 
             match res {
@@ -623,6 +622,8 @@ where W: WalTypes
     /// # Returns
     ///
     /// Returns the checkpoint if a chunk was closed, None otherwise.
+    /// Rotation waits until the predecessor is synced and the successor is
+    /// durably created by the flush worker.
     ///
     /// # Errors
     ///
@@ -638,7 +639,6 @@ where W: WalTypes
             return Ok(None);
         }
 
-        let config = self.config.clone();
         let offset = self.open.chunk.last_segment().end();
 
         info!(
@@ -648,38 +648,28 @@ where W: WalTypes
         );
 
         let checkpoint = state_machine.checkpoint();
-
-        let new_open = {
-            let chunk_id = ChunkId(offset.0);
-            OpenChunk::create(
-                config,
-                chunk_id,
-                WALRecord::Checkpoint(checkpoint.clone()),
-            )?
-        };
-
-        let mut old_open = std::mem::replace(&mut self.open, new_open);
-
-        let prev_pending_data = old_open.take_pending_data();
-        if !prev_pending_data.is_empty() {
-            self.send_request(WorkerRequest::Write(WriteRequest {
-                upto_offset: offset.0,
-                data: prev_pending_data,
-                sync: true,
-                callback: None,
-            }))?;
-        }
-
         let checkpoint = Arc::new(checkpoint);
 
-        self.send_request(WorkerRequest::AppendFile(FileEntry::new(
-            offset.0,
-            self.open.chunk.f.clone(),
-            ChunkPersistedCallback::new(
-                self.on_chunk_persisted.clone(),
-                Some(checkpoint.clone()),
-            ),
-        )))?;
+        let prev_pending_data = self.open.take_pending_data();
+        self.send_request(WorkerRequest::Write(WriteRequest {
+            upto_offset: offset.0,
+            data: prev_pending_data,
+            sync: true,
+            callback: None,
+        }))?;
+
+        let callback = ChunkPersistedCallback::new(
+            self.on_chunk_persisted.clone(),
+            Some(checkpoint.clone()),
+        );
+        let new_open = Self::create_open_chunk(
+            &mut self.flush_client,
+            self.config.clone(),
+            ChunkId(offset.0),
+            WALRecord::Checkpoint(checkpoint.as_ref().clone()),
+            callback,
+        )?;
+        let old_open = std::mem::replace(&mut self.open, new_open);
 
         let chunk = old_open.chunk;
         let closed_id = chunk.chunk_id();
@@ -744,9 +734,13 @@ mod tests {
     use std::io::Seek;
     use std::io::Write;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc::SyncSender;
     use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
 
     use codeq::Decode;
     use codeq::Encode;
@@ -872,6 +866,25 @@ mod tests {
         )
     }
 
+    fn gated_callback(
+        calls: Arc<Mutex<Vec<PersistedCall>>>,
+        enabled: Arc<AtomicBool>,
+        entered: SyncSender<()>,
+        release: Arc<Barrier>,
+    ) -> ChunkPersistedFn<TestWal> {
+        Arc::new(move |persisted, checkpoint| {
+            calls.lock().unwrap().push(PersistedCall {
+                starting_offset: persisted.starting_offset,
+                synced_offset: persisted.synced_offset,
+                checkpoint: checkpoint.as_deref().cloned(),
+            });
+            if enabled.swap(false, Ordering::SeqCst) {
+                entered.send(()).unwrap();
+                release.wait();
+            }
+        })
+    }
+
     fn open_wal(
         config: &Config,
         calls: Arc<Mutex<Vec<PersistedCall>>>,
@@ -891,11 +904,20 @@ mod tests {
         sm: &mut TestStateMachine,
         value: &str,
     ) -> Result<crate::Segment, io::Error> {
+        let segment = append_without_rotate(wal, sm, value)?;
+        wal.try_close_full_chunk(sm)?;
+        Ok(segment)
+    }
+
+    fn append_without_rotate(
+        wal: &mut ChunkedWal<TestWal>,
+        sm: &mut TestStateMachine,
+        value: &str,
+    ) -> Result<crate::Segment, io::Error> {
         let record = action(value);
         wal.append(&record)?;
         let segment = wal.last_segment();
         sm.apply(&record, wal.open.chunk.chunk_id(), segment)?;
-        wal.try_close_full_chunk(sm)?;
         Ok(segment)
     }
 
@@ -939,6 +961,19 @@ mod tests {
             .collect::<Result<Vec<_>, io::Error>>()?;
         names.sort();
         Ok(names)
+    }
+
+    fn copy_wal_dir(
+        source: &Config,
+    ) -> Result<(tempfile::TempDir, Config), io::Error> {
+        let target = tempfile::tempdir()?;
+        for entry in std::fs::read_dir(&source.dir)? {
+            let entry = entry?;
+            let target_path = target.path().join(entry.file_name());
+            std::fs::copy(entry.path(), target_path)?;
+        }
+        let config = Config::new(target.path().to_str().unwrap());
+        Ok((target, config))
     }
 
     #[test]
@@ -1011,6 +1046,91 @@ mod tests {
             records
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_rotation_creates_successor_after_predecessor_sync()
+    -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let enabled = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let release = Arc::new(Barrier::new(2));
+        let mut sm = TestStateMachine::default();
+        let mut wal = ChunkedWal::open(
+            Arc::new(config.clone()),
+            &mut sm,
+            gated_callback(calls, enabled.clone(), entered_tx, release.clone()),
+        )?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        sync_flush(&mut wal)?;
+        enabled.store(true, Ordering::SeqCst);
+
+        let rotation = std::thread::spawn(move || {
+            append_action(&mut wal, &mut sm, "b")?;
+            Ok::<_, io::Error>((wal, sm))
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).map_err(|e| {
+            io::Error::other(format!("wait for predecessor sync: {e}"))
+        })?;
+
+        let names = wal_file_names(&config);
+        let snapshot = copy_wal_dir(&config);
+        release.wait();
+        let (wal, sm) = rotation.join().unwrap()?;
+
+        assert_eq!(
+            vec![
+                WalLock::LOCK_FILE_NAME.to_string(),
+                Config::chunk_file_name(ChunkId(0)),
+            ],
+            names?
+        );
+
+        let (_snapshot_dir, snapshot_config) = snapshot?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (_snapshot_wal, snapshot_sm) = open_wal(&snapshot_config, calls)?;
+        assert_eq!(vec!["a", "b"], snapshot_sm.values);
+        assert_eq!(vec!["a", "b"], sm.values);
+        assert_eq!(
+            vec![
+                WalLock::LOCK_FILE_NAME.to_string(),
+                Config::chunk_file_name(ChunkId(0)),
+                Config::chunk_file_name(wal.open_chunk_id()),
+            ],
+            wal_file_names(&config)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rotation_syncs_previously_written_predecessor()
+    -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls.clone())?;
+        append_without_rotate(&mut wal, &mut sm, "a")?;
+        append_without_rotate(&mut wal, &mut sm, "b")?;
+        let successor_id = ChunkId(wal.last_segment().end().0);
+
+        no_sync_flush(&mut wal)?;
+        wal.try_close_full_chunk(&sm)?;
+
+        assert_eq!(successor_id, wal.open_chunk_id());
+        assert_eq!(
+            vec![PersistedCall {
+                starting_offset: 0,
+                synced_offset: successor_id.offset(),
+                checkpoint: None,
+            }],
+            *calls.lock().unwrap()
+        );
         Ok(())
     }
 
@@ -1146,6 +1266,38 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let err = open_wal(&config, calls).unwrap_err();
         assert!(err.to_string().contains("Gap between chunks"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rotation_create_failure_does_not_overwrite_chunk()
+    -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+        append_without_rotate(&mut wal, &mut sm, "a")?;
+        append_without_rotate(&mut wal, &mut sm, "b")?;
+        let successor_id = ChunkId(wal.last_segment().end().0);
+        let successor_path = config.chunk_path(successor_id);
+        std::fs::write(&successor_path, [9, 8, 7])?;
+
+        let err = wal.try_close_full_chunk(&sm).unwrap_err();
+        assert_eq!(io::ErrorKind::AlreadyExists, err.kind());
+        assert_eq!(vec![9, 8, 7], std::fs::read(successor_path)?);
+
+        let worker_err = wal.wait_worker_idle().unwrap_err();
+        assert_eq!(io::ErrorKind::AlreadyExists, worker_err.kind());
+        let names = wal_file_names(&config)?;
+        assert_eq!(
+            vec![
+                WalLock::LOCK_FILE_NAME.to_string(),
+                Config::chunk_file_name(ChunkId(0)),
+                Config::chunk_file_name(successor_id),
+            ],
+            names
+        );
         Ok(())
     }
 
