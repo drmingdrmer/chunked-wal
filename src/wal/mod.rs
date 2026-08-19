@@ -141,6 +141,7 @@ where W: WalTypes
                 chunk_id,
                 Some(chunk_id) == tail_chunk_id,
             )?;
+            Self::ensure_initial_checkpoint(chunk_id, &records)?;
 
             on_chunk_persisted(
                 ChunkPersisted {
@@ -313,6 +314,18 @@ where W: WalTypes
         }
 
         Ok(())
+    }
+
+    fn ensure_initial_checkpoint(
+        chunk_id: ChunkId,
+        records: &[WALRecord<W>],
+    ) -> Result<(), io::Error> {
+        if matches!(records.first(), Some(WALRecord::Checkpoint(_))) {
+            return Ok(());
+        }
+
+        let message = format!("Chunk {chunk_id} must start with a checkpoint");
+        Err(io::Error::new(io::ErrorKind::InvalidData, message))
     }
 
     fn reopen_last_closed(
@@ -704,6 +717,7 @@ mod tests {
     use crate::StateMachine;
     use crate::WAL;
     use crate::WALRecord;
+    use crate::WalLock;
     use crate::WalTypes;
 
     const TEST_ACTION_TYPE: u32 = 1;
@@ -874,6 +888,14 @@ mod tests {
             .collect()
     }
 
+    fn wal_file_names(config: &Config) -> Result<Vec<String>, io::Error> {
+        let mut names = std::fs::read_dir(&config.dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, io::Error>>()?;
+        names.sort();
+        Ok(names)
+    }
+
     #[test]
     fn test_open_append_flush_reopen() -> Result<(), io::Error> {
         let (_td, config) = temp_config();
@@ -944,6 +966,41 @@ mod tests {
             records
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_rejects_non_tail_chunk_without_checkpoint()
+    -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+
+        let mut action_data = Vec::new();
+        action("a").encode(&mut action_data)?;
+        let tail_id = ChunkId(action_data.len() as u64);
+        let first_path = config.chunk_path(ChunkId(0));
+        std::fs::write(first_path, action_data)?;
+
+        let mut checkpoint_data = Vec::new();
+        WALRecord::<TestWal>::Checkpoint("a".to_string())
+            .encode(&mut checkpoint_data)?;
+        let tail_path = config.chunk_path(tail_id);
+        std::fs::write(tail_path, checkpoint_data)?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let err = open_wal(&config, calls).unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidData, err.kind());
+        let message = err.to_string();
+        assert!(message.contains("must start with a checkpoint"));
+        let names = wal_file_names(&config)?;
+        assert_eq!(
+            vec![
+                WalLock::LOCK_FILE_NAME.to_string(),
+                Config::chunk_file_name(ChunkId(0)),
+                Config::chunk_file_name(tail_id),
+            ],
+            names
+        );
         Ok(())
     }
 
