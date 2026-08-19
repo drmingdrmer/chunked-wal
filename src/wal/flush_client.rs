@@ -1,9 +1,12 @@
+use std::fs::File;
 use std::io;
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
 use crate::WalTypes;
+use crate::wal::flush_request::CreateChunkRequest;
 use crate::wal::flush_request::SeqRequest;
 use crate::wal::flush_request::WorkerRequest;
 use crate::wal::flush_worker::WorkerState;
@@ -37,21 +40,42 @@ where W: WalTypes
         }
     }
 
-    /// Assigns the next sequence number and sends the request to the worker.
+    /// Assigns and returns the next sequence after sending the request.
     pub(super) fn send(
         &mut self,
         req: WorkerRequest<W>,
-    ) -> Result<(), io::Error> {
-        self.sent_seq += 1;
+    ) -> Result<u64, io::Error> {
+        let seq = self.sent_seq + 1;
         self.tx
             .send(SeqRequest {
-                seq: self.sent_seq,
+                seq,
                 queued_at: Instant::now(),
                 req,
             })
-            .map_err(|e| {
-                io::Error::other(format!("Failed to send request: {}", e))
-            })
+            .map_err(|e| io::Error::other(format!("send request: {e}")))?;
+        self.sent_seq = seq;
+        Ok(seq)
+    }
+
+    /// Creates a chunk through the worker and returns its file handle.
+    pub(super) fn create_chunk(
+        &mut self,
+        request: CreateChunkRequest<W>,
+        result_rx: Receiver<Result<Arc<File>, io::Error>>,
+    ) -> Result<Arc<File>, io::Error> {
+        let seq = self.send(WorkerRequest::CreateChunk(request))?;
+        match result_rx.recv() {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some(failure) = self.state.failure() {
+                    return Err(failure);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("receive created chunk: {err}; request: {seq}"),
+                ))
+            }
+        }
     }
 
     /// Waits until the worker reaches the current sequence or reports failure.

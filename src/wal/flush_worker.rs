@@ -81,6 +81,14 @@ impl WorkerState {
         self.changed.notify_all();
     }
 
+    pub(crate) fn failure(&self) -> Option<io::Error> {
+        let progress = self.progress.lock().unwrap();
+        let WorkerStatus::Failed(err) = &progress.status else {
+            return None;
+        };
+        Some(io::Error::new(err.kind(), err.to_string()))
+    }
+
     pub(crate) fn wait_for(&self, target_seq: u64) -> Result<(), io::Error> {
         let mut progress = self.progress.lock().unwrap();
         loop {
@@ -551,6 +559,10 @@ mod tests {
         let got = state.wait_for(1).unwrap_err();
         assert_eq!(io::ErrorKind::PermissionDenied, got.kind());
         assert_eq!("no write", got.to_string());
+
+        let failure = state.failure().unwrap();
+        assert_eq!(io::ErrorKind::PermissionDenied, failure.kind());
+        assert_eq!("no write", failure.to_string());
     }
 
     #[test]

@@ -37,7 +37,6 @@ where W: WalTypes
 impl<W> CreateChunkRequest<W>
 where W: WalTypes
 {
-    #[allow(dead_code)]
     pub(crate) fn new(
         config: Arc<Config>,
         chunk_id: ChunkId,
@@ -122,7 +121,6 @@ pub(crate) enum WorkerRequest<W>
 where W: WalTypes
 {
     /// Create, initialize, and begin tracking a new chunk file.
-    #[allow(dead_code)]
     CreateChunk(CreateChunkRequest<W>),
 
     /// Append a new file that will be need to be sync.

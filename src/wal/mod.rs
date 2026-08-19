@@ -44,6 +44,7 @@ use crate::wal::file_persisted::ChunkPersisted;
 use crate::wal::file_persisted::ChunkPersistedCallback;
 pub use crate::wal::file_persisted::ChunkPersistedFn;
 use crate::wal::flush_client::FlushClient;
+use crate::wal::flush_request::CreateChunkRequest;
 use crate::wal::flush_request::WriteRequest;
 use crate::wal::flush_worker::FlushWorker;
 use crate::wal::flush_worker::WorkerState;
@@ -60,7 +61,7 @@ where W: WalTypes
     open: OpenChunk<WALRecord<W>>,
     closed: BTreeMap<ChunkId, ClosedChunk<W>>,
 
-    /// Sends user write operations to the flush worker.
+    /// Sends ordered filesystem operations to the flush worker.
     ///
     /// Each write operation may carry its own callback, defined by
     /// `W::Callback`.
@@ -166,23 +167,14 @@ where W: WalTypes
 
         let open = Self::reopen_last_closed(&mut closed);
 
-        let open = if let Some(open) = open {
-            open
-        } else {
-            OpenChunk::create(
-                config.clone(),
-                ChunkId(prev_end_offset.unwrap_or_default()),
-                WALRecord::Checkpoint(state_machine.checkpoint()),
-            )?
-        };
-
-        Ok(Self::new(
+        Self::new(
             config,
             closed,
             open,
+            state_machine.checkpoint(),
             on_chunk_persisted,
             dir_lock,
-        ))
+        )
     }
 
     /// Dumps all records while holding the WAL directory lock.
@@ -215,29 +207,29 @@ where W: WalTypes
     ///
     /// * `config` - Configuration for the WAL
     /// * `closed` - Map of closed (immutable) chunks indexed by chunk ID
-    /// * `open` - The currently active chunk that can be written to
+    /// * `open` - The recovered active chunk, if one exists
+    /// * `initial_checkpoint` - Checkpoint for a newly created active chunk
     /// * `on_chunk_persisted` - Callback invoked after chunk data is persisted
     fn new(
         config: Arc<Config>,
         closed: BTreeMap<ChunkId, ClosedChunk<W>>,
-        open: OpenChunk<WALRecord<W>>,
+        open: Option<OpenChunk<WALRecord<W>>>,
+        initial_checkpoint: W::Checkpoint,
         on_chunk_persisted: ChunkPersistedFn<W>,
         dir_lock: WalLock,
-    ) -> Self {
+    ) -> Result<Self, io::Error> {
         let prev_checkpoint =
             closed.iter().last().map(|(_, c)| c.state.clone());
-
-        let offset = open.chunk.global_start();
-        let f = open.chunk.f.clone();
-
-        let file_entry = FileEntry::new(
-            offset,
-            f,
-            ChunkPersistedCallback::new(
-                on_chunk_persisted.clone(),
-                prev_checkpoint,
-            ),
-        );
+        let file_entry = open.as_ref().map(|open| {
+            FileEntry::new(
+                open.chunk.global_start(),
+                open.chunk.f.clone(),
+                ChunkPersistedCallback::new(
+                    on_chunk_persisted.clone(),
+                    prev_checkpoint.clone(),
+                ),
+            )
+        });
 
         let worker_state = Arc::new(WorkerState::new());
         let flush_metrics = Arc::new(AtomicFlushMetrics::default());
@@ -245,7 +237,7 @@ where W: WalTypes
         let (flush_tx, rx) = std::sync::mpsc::sync_channel(1024);
         let worker = FlushWorker::new(
             rx,
-            Some(file_entry),
+            file_entry,
             worker_state.clone(),
             flush_metrics.clone(),
             config.flush_batch_wait(),
@@ -254,9 +246,29 @@ where W: WalTypes
 
         worker.spawn();
 
-        let flush_client = FlushClient::new(flush_tx, worker_state);
+        let mut flush_client = FlushClient::new(flush_tx, worker_state);
+        let open = match open {
+            Some(open) => open,
+            None => {
+                let chunk_id = closed
+                    .last_key_value()
+                    .map(|(_, chunk)| ChunkId(chunk.chunk.global_end()))
+                    .unwrap_or(ChunkId(0));
+                let callback = ChunkPersistedCallback::new(
+                    on_chunk_persisted.clone(),
+                    prev_checkpoint,
+                );
+                Self::create_open_chunk(
+                    &mut flush_client,
+                    config.clone(),
+                    chunk_id,
+                    WALRecord::Checkpoint(initial_checkpoint),
+                    callback,
+                )?
+            }
+        };
 
-        Self {
+        Ok(Self {
             config,
             open,
             closed,
@@ -264,7 +276,22 @@ where W: WalTypes
             on_chunk_persisted,
             flush_metrics,
             _dir_lock: dir_lock,
-        }
+        })
+    }
+
+    fn create_open_chunk(
+        flush_client: &mut FlushClient<W>,
+        config: Arc<Config>,
+        chunk_id: ChunkId,
+        initial_record: WALRecord<W>,
+        on_persisted: ChunkPersistedCallback<W>,
+    ) -> Result<OpenChunk<WALRecord<W>>, io::Error> {
+        let data = OpenChunk::encode_initial_record(&initial_record)?;
+        let record_size = data.len() as u64;
+        let (request, result_rx) =
+            CreateChunkRequest::new(config, chunk_id, data, on_persisted);
+        let file = flush_client.create_chunk(request, result_rx)?;
+        Ok(OpenChunk::from_created_file(file, chunk_id, record_size))
     }
 
     fn ensure_consecutive_chunks(
@@ -442,7 +469,8 @@ where W: WalTypes
     /// Wraps a `WorkerRequest` with an auto-incrementing seq and sends it to
     /// the FlushWorker.
     fn send_request(&mut self, req: WorkerRequest<W>) -> Result<(), io::Error> {
-        self.flush_client.send(req)
+        self.flush_client.send(req)?;
+        Ok(())
     }
 
     /// Block until the FlushWorker has processed all requests sent so far.
