@@ -14,6 +14,7 @@ pub(crate) mod write_batch;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
@@ -23,6 +24,7 @@ use codeq::OffsetSize;
 pub use flush_request::FlushStat;
 pub(crate) use flush_request::WorkerRequest;
 use log::info;
+use log::warn;
 
 use crate::Chunk;
 use crate::ChunkId;
@@ -126,7 +128,8 @@ where W: WalTypes
     where
         SM: StateMachine<W>,
     {
-        let chunk_ids = Self::load_chunk_ids(&config, &dir_lock)?;
+        let mut chunk_ids = Self::load_chunk_ids(&config, &dir_lock)?;
+        Self::remove_invalid_tail(&config, &mut chunk_ids)?;
 
         let mut closed = BTreeMap::new();
         let mut prev_end_offset = None;
@@ -314,6 +317,48 @@ where W: WalTypes
         }
 
         Ok(())
+    }
+
+    fn remove_invalid_tail(
+        config: &Config,
+        chunk_ids: &mut Vec<ChunkId>,
+    ) -> Result<(), io::Error> {
+        let Some(chunk_id) = chunk_ids.last().copied() else {
+            return Ok(());
+        };
+        let Some(reason) = Self::invalid_chunk_reason(config, chunk_id)? else {
+            return Ok(());
+        };
+
+        warn!("Removing invalid trailing chunk {chunk_id}: {reason}");
+        let path = config.chunk_path(chunk_id);
+        std::fs::remove_file(path)?;
+        let dir = File::open(&config.dir)?;
+        dir.sync_all()?;
+        chunk_ids.pop();
+        Ok(())
+    }
+
+    fn invalid_chunk_reason(
+        config: &Config,
+        chunk_id: ChunkId,
+    ) -> Result<Option<String>, io::Error> {
+        let file = Chunk::<WALRecord<W>>::open_chunk_file(config, chunk_id)?;
+        let file = Arc::new(file);
+        let mut records =
+            Chunk::<WALRecord<W>>::load_records_iter(config, file, chunk_id)?;
+
+        match records.next() {
+            Some(Ok((_, WALRecord::Checkpoint(_)))) => Ok(None),
+            Some(Ok(_)) => Ok(Some("first record is not a checkpoint".into())),
+            Some(Err(err)) => match err.kind() {
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => {
+                    Ok(Some(err.to_string()))
+                }
+                _ => Err(err),
+            },
+            None => Ok(Some("chunk contains no records".into())),
+        }
     }
 
     fn ensure_initial_checkpoint(
@@ -970,6 +1015,86 @@ mod tests {
     }
 
     #[test]
+    fn test_reopen_removes_invalid_trailing_chunk() -> Result<(), io::Error> {
+        let mut checkpoint_data = Vec::new();
+        WALRecord::<TestWal>::Checkpoint("a".to_string())
+            .encode(&mut checkpoint_data)?;
+
+        let mut partial_checkpoint = checkpoint_data.clone();
+        partial_checkpoint.pop();
+
+        let mut damaged_checkpoint = checkpoint_data;
+        let last_byte = damaged_checkpoint.last_mut().unwrap();
+        *last_byte ^= 1;
+
+        let mut initial_action = Vec::new();
+        action("unexpected").encode(&mut initial_action)?;
+
+        let cases = [
+            ("empty", Vec::new()),
+            ("partial checkpoint", partial_checkpoint),
+            ("damaged checkpoint", damaged_checkpoint),
+            ("action first", initial_action),
+        ];
+
+        for (case, data) in cases {
+            let (_td, mut config) = temp_config();
+            config.truncate_incomplete_record = Some(false);
+            let trailing_id = {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let (mut wal, mut sm) = open_wal(&config, calls)?;
+                append_action(&mut wal, &mut sm, "a")?;
+                sync_flush(&mut wal)?;
+                let segment = wal.last_segment();
+                ChunkId(segment.end().0)
+            };
+            let trailing_path = config.chunk_path(trailing_id);
+            std::fs::write(&trailing_path, data)?;
+
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (wal, sm) = open_wal(&config, calls)?;
+
+            assert_eq!(vec!["a"], sm.values, "{case}");
+            let open_chunk_id = wal.open_chunk_id();
+            assert_eq!(ChunkId(0), open_chunk_id, "{case}");
+            let names = wal_file_names(&config)?;
+            assert_eq!(
+                vec![
+                    WalLock::LOCK_FILE_NAME.to_string(),
+                    Config::chunk_file_name(ChunkId(0)),
+                ],
+                names,
+                "{case}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_replaces_invalid_only_chunk() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+        let chunk_path = config.chunk_path(ChunkId(0));
+        std::fs::write(chunk_path, [])?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (wal, sm) = open_wal(&config, calls)?;
+
+        assert_eq!(Vec::<String>::new(), sm.values);
+        let records = records_in_chunk(&config, ChunkId(0))?;
+        assert_eq!(vec![WALRecord::Checkpoint(String::new())], records);
+        let names = wal_file_names(&config)?;
+        assert_eq!(
+            vec![
+                WalLock::LOCK_FILE_NAME.to_string(),
+                Config::chunk_file_name(ChunkId(0)),
+            ],
+            names
+        );
+        assert_eq!(ChunkId(0), wal.open_chunk_id());
+        Ok(())
+    }
+
+    #[test]
     fn test_reopen_rejects_non_tail_chunk_without_checkpoint()
     -> Result<(), io::Error> {
         let (_td, config) = temp_config();
@@ -1001,6 +1126,26 @@ mod tests {
             ],
             names
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_rejects_gap_between_chunks() -> Result<(), io::Error> {
+        let (_td, config) = temp_config();
+        {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+            append_action(&mut wal, &mut sm, "a")?;
+            sync_flush(&mut wal)?;
+        }
+
+        let source = config.chunk_path(ChunkId(0));
+        let gap = config.chunk_path(ChunkId(999));
+        std::fs::copy(source, gap)?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let err = open_wal(&config, calls).unwrap_err();
+        assert!(err.to_string().contains("Gap between chunks"));
         Ok(())
     }
 
