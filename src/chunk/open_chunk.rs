@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
@@ -36,8 +37,55 @@ where Rec: Encode
     pub(crate) fn create(
         config: Arc<Config>,
         chunk_id: ChunkId,
+    ) -> Result<Self, io::Error> {
+        let f = Self::create_file(config.clone(), chunk_id)?;
+
+        let open = Self::from_file(chunk_id, f)?;
+
+        Ok(open)
+    }
+
+    pub(crate) fn from_file(
+        chunk_id: ChunkId,
+        f: Arc<File>,
+    ) -> Result<Self, io::Error> {
+        let record_offsets = vec![*chunk_id];
+
+        let chunk = Chunk {
+            f,
+            global_offsets: record_offsets,
+            truncated: None,
+            _p: Default::default(),
+        };
+
+        let open = Self {
+            pending_data: Vec::new(),
+            chunk,
+        };
+
+        Ok(open)
+    }
+
+    /// Create a new open chunk and append an initial record to it.
+    /// But does not fsync it.
+    pub(crate) fn create_with_initial_record(
+        config: Arc<Config>,
+        chunk_id: ChunkId,
         initial_record: Rec,
     ) -> Result<Self, io::Error> {
+        let mut open = Self::create(config, chunk_id)?;
+
+        open.append_record(&initial_record)?;
+        open.chunk.f.write_all(&open.pending_data)?;
+        open.pending_data.clear();
+
+        Ok(open)
+    }
+
+    pub(crate) fn create_file(
+        config: Arc<Config>,
+        chunk_id: ChunkId,
+    ) -> Result<Arc<File>, io::Error> {
         let path = config.chunk_path(chunk_id);
         let f = OpenOptions::new()
             .write(true)
@@ -45,25 +93,7 @@ where Rec: Encode
             .create_new(true)
             .open(path)?;
 
-        let record_offsets = vec![*chunk_id];
-
-        let chunk = Chunk {
-            f: Arc::new(f),
-            global_offsets: record_offsets,
-            truncated: None,
-            _p: Default::default(),
-        };
-
-        let mut open = Self {
-            pending_data: Vec::new(),
-            chunk,
-        };
-
-        open.append_record(&initial_record)?;
-        open.chunk.f.write_all(&open.pending_data)?;
-        open.pending_data.clear();
-
-        Ok(open)
+        Ok(Arc::new(f))
     }
 
     pub(crate) fn append_record(

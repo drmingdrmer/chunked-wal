@@ -169,7 +169,7 @@ where W: WalTypes
         let open = if let Some(open) = open {
             open
         } else {
-            OpenChunk::create(
+            OpenChunk::create_with_initial_record(
                 config.clone(),
                 ChunkId(prev_end_offset.unwrap_or_default()),
                 WALRecord::Checkpoint(state_machine.checkpoint()),
@@ -565,7 +565,7 @@ where W: WalTypes
 
         let new_open = {
             let chunk_id = ChunkId(offset.0);
-            OpenChunk::create(
+            OpenChunk::create_with_initial_record(
                 config,
                 chunk_id,
                 WALRecord::Checkpoint(checkpoint.clone()),

@@ -109,11 +109,12 @@ mod tests {
         let config = Arc::new(config);
         let chunk_id = ChunkId(0);
 
-        let mut open = OpenChunk::<WALRecord<TestWal>>::create(
-            config.clone(),
-            chunk_id,
-            WALRecord::Checkpoint(String::new()),
-        )?;
+        let mut open =
+            OpenChunk::<WALRecord<TestWal>>::create_with_initial_record(
+                config.clone(),
+                chunk_id,
+                WALRecord::Checkpoint(String::new()),
+            )?;
         open.append_record(&action("val"))?;
         let data = open.take_pending_data();
         let offset = open.chunk.f.metadata()?.len();
