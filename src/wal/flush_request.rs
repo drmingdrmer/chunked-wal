@@ -1,9 +1,60 @@
 use std::fmt;
+use std::fs::File;
+use std::io;
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::sync_channel;
 use std::time::Instant;
 
+use crate::ChunkId;
+use crate::Config;
 use crate::WalTypes;
 use crate::wal::file_entry::FileEntry;
+use crate::wal::file_persisted::ChunkPersistedCallback;
+
+pub(crate) struct CreateChunkRequest<W>
+where W: WalTypes
+{
+    pub(crate) config: Arc<Config>,
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) data: Vec<u8>,
+    pub(crate) on_persisted: ChunkPersistedCallback<W>,
+    pub(crate) result_tx: SyncSender<Result<Arc<File>, io::Error>>,
+}
+
+impl<W> fmt::Debug for CreateChunkRequest<W>
+where W: WalTypes
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateChunkRequest")
+            .field("chunk_id", &self.chunk_id)
+            .field("data_len", &self.data.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W> CreateChunkRequest<W>
+where W: WalTypes
+{
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        config: Arc<Config>,
+        chunk_id: ChunkId,
+        data: Vec<u8>,
+        on_persisted: ChunkPersistedCallback<W>,
+    ) -> (Self, Receiver<Result<Arc<File>, io::Error>>) {
+        let (result_tx, result_rx) = sync_channel(1);
+        let request = Self {
+            config,
+            chunk_id,
+            data,
+            on_persisted,
+            result_tx,
+        };
+        (request, result_rx)
+    }
+}
 
 /// A `WorkerRequest` tagged with a monotonically increasing sequence number.
 ///
@@ -70,6 +121,10 @@ impl FlushStat {
 pub(crate) enum WorkerRequest<W>
 where W: WalTypes
 {
+    /// Create, initialize, and begin tracking a new chunk file.
+    #[allow(dead_code)]
+    CreateChunk(CreateChunkRequest<W>),
+
     /// Append a new file that will be need to be sync.
     AppendFile(FileEntry<W>),
 
@@ -92,6 +147,9 @@ where W: WalTypes
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            WorkerRequest::CreateChunk(request) => {
+                f.debug_tuple("CreateChunk").field(request).finish()
+            }
             WorkerRequest::AppendFile(file_entry) => {
                 f.debug_tuple("AppendFile").field(file_entry).finish()
             }
@@ -117,10 +175,13 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::time::Instant;
 
+    use crate::ChunkId;
+    use crate::Config;
     use crate::WalTypes;
     use crate::wal::file_entry::FileEntry;
     use crate::wal::file_persisted::ChunkPersistedCallback;
     use crate::wal::file_persisted::ChunkPersistedFn;
+    use crate::wal::flush_request::CreateChunkRequest;
     use crate::wal::flush_request::FlushStat;
     use crate::wal::flush_request::SeqRequest;
     use crate::wal::flush_request::WorkerRequest;
@@ -207,6 +268,19 @@ mod tests {
         assert_eq!(
             "AppendFile(FileEntry { starting_offset: ChunkId(12), sync_id: 0 })",
             format!("{append:?}")
+        );
+
+        let config = Arc::new(Config::new("wal-dir"));
+        let (create, _rx) = CreateChunkRequest::<TestWal>::new(
+            config,
+            ChunkId(12),
+            vec![1, 2, 3],
+            callback(),
+        );
+        let create = WorkerRequest::CreateChunk(create);
+        assert_eq!(
+            "CreateChunk(CreateChunkRequest { chunk_id: ChunkId(12), data_len: 3, .. })",
+            format!("{create:?}")
         );
 
         Ok(())

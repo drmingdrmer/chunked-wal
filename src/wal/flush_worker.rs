@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::IoSlice;
 use std::io::Write;
@@ -14,12 +15,15 @@ use std::time::Instant;
 use log::debug;
 use log::info;
 
+use crate::ChunkId;
+use crate::Config;
 use crate::WalTypes;
 use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
 use crate::wal::batch_metrics::BatchMetrics;
 use crate::wal::callback::Callback;
 use crate::wal::file_entry::FileEntry;
 use crate::wal::file_persisted::ChunkPersisted;
+use crate::wal::flush_request::CreateChunkRequest;
 use crate::wal::flush_request::FlushStat;
 use crate::wal::flush_request::SeqRequest;
 use crate::wal::flush_request::WorkerRequest;
@@ -289,6 +293,9 @@ where W: WalTypes
         req: WorkerRequest<W>,
     ) -> Result<(), io::Error> {
         match req {
+            WorkerRequest::CreateChunk(request) => {
+                self.handle_create_chunk(request)?;
+            }
             WorkerRequest::AppendFile(file_entry) => {
                 info!("FlushWorker: AppendFile: {}", file_entry);
                 self.files.push(file_entry);
@@ -321,6 +328,25 @@ where W: WalTypes
         Ok(())
     }
 
+    fn handle_create_chunk(
+        &mut self,
+        request: CreateChunkRequest<W>,
+    ) -> Result<(), io::Error> {
+        let file =
+            create_chunk_file(&request.config, request.chunk_id, &request.data)
+                .map_err(|err| report_create_error(&request.result_tx, err))?;
+
+        let file_entry = FileEntry::new(
+            request.chunk_id.offset(),
+            file.clone(),
+            request.on_persisted,
+        );
+        info!("FlushWorker: CreateChunk: {}", file_entry);
+        self.files.push(file_entry);
+        let _ = request.result_tx.send(Ok(file));
+        Ok(())
+    }
+
     pub fn sync_data_files(&mut self, offset: u64) -> Result<(), io::Error> {
         let files = &mut self.files;
 
@@ -347,6 +373,39 @@ where W: WalTypes
 
         Ok(())
     }
+}
+
+fn create_chunk_file(
+    config: &Config,
+    chunk_id: ChunkId,
+    data: &[u8],
+) -> Result<Arc<File>, io::Error> {
+    if data.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "initial chunk record must not be empty",
+        ));
+    }
+
+    let path = config.chunk_path(chunk_id);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    File::open(&config.dir)?.sync_all()?;
+    Ok(Arc::new(file))
+}
+
+fn report_create_error(
+    result_tx: &std::sync::mpsc::SyncSender<Result<Arc<File>, io::Error>>,
+    err: io::Error,
+) -> io::Error {
+    let returned = io::Error::new(err.kind(), err.to_string());
+    let _ = result_tx.send(Err(returned));
+    err
 }
 
 fn write_batch_vectored<W>(
