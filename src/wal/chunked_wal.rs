@@ -130,7 +130,6 @@ where W: WalTypes
 
             on_chunk_persisted(
                 ChunkPersisted {
-                    file: chunk.f.clone(),
                     starting_offset: chunk.global_start(),
                     synced_offset: chunk.global_end(),
                 },

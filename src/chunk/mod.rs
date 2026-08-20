@@ -138,9 +138,11 @@ impl<Rec> Chunk<Rec> {
         chunk_id: ChunkId,
     ) -> Result<File, io::Error> {
         let path = config.chunk_path(chunk_id);
+        // Reads are positional, and append mode keeps every write at the end
+        // of the file regardless of this file description's cursor.
         let f = OpenOptions::new()
             .read(true)
-            .write(true)
+            .append(true)
             .open(path)
             .context(|| format!("open {}", chunk_id))?;
 

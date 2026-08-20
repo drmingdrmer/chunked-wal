@@ -1,12 +1,17 @@
 use std::fmt;
-use std::fs::File;
 use std::sync::Arc;
 
 use crate::ChunkId;
 use crate::WalTypes;
 
+/// Describes a chunk file whose records up to `synced_offset` are on stable
+/// storage.
+///
+/// The chunk's file handle is deliberately absent: it is the one the flush
+/// worker writes through. Reopen the file from
+/// [`Config::chunk_path`](crate::Config::chunk_path) when the callback needs
+/// to read it.
 pub struct ChunkPersisted {
-    pub file: Arc<File>,
     pub starting_offset: u64,
     pub synced_offset: u64,
 }
@@ -14,7 +19,6 @@ pub struct ChunkPersisted {
 impl fmt::Debug for ChunkPersisted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ChunkPersisted")
-            .field("file", &self.file)
             .field("starting_offset", &ChunkId(self.starting_offset))
             .field("synced_offset", &ChunkId(self.synced_offset))
             .finish()
@@ -82,21 +86,16 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_persisted_debug() -> Result<(), io::Error> {
-        let file = tempfile::tempfile()?;
+    fn test_chunk_persisted_debug() {
         let persisted = ChunkPersisted {
-            file: Arc::new(file),
             starting_offset: 12,
             synced_offset: 34,
         };
 
-        let got = format!("{persisted:?}");
-
-        assert!(got.contains("ChunkPersisted"));
-        assert!(got.contains("starting_offset: ChunkId(12)"));
-        assert!(got.contains("synced_offset: ChunkId(34)"));
-
-        Ok(())
+        assert_eq!(
+            "ChunkPersisted { starting_offset: ChunkId(12), synced_offset: ChunkId(34) }",
+            format!("{persisted:?}")
+        );
     }
 
     #[test]
@@ -119,12 +118,10 @@ mod tests {
         );
 
         cb.call(ChunkPersisted {
-            file: Arc::new(tempfile::tempfile()?),
             starting_offset: 1,
             synced_offset: 2,
         });
         cb.call(ChunkPersisted {
-            file: Arc::new(tempfile::tempfile()?),
             starting_offset: 3,
             synced_offset: 4,
         });

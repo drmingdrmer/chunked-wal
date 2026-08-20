@@ -776,6 +776,33 @@ fn test_flush_without_sync_writes_without_advancing_sync_id()
 }
 
 #[test]
+fn test_writes_ignore_a_moved_file_cursor() -> Result<(), io::Error> {
+    let (_td, config) = temp_config();
+
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        sync_flush(&mut wal)?;
+
+        // The flush worker shares this file description, so rewinding it
+        // would send the next write to the start of the chunk.
+        let mut writer_file: &std::fs::File = &wal.open.chunk.f;
+        writer_file.seek(io::SeekFrom::Start(0))?;
+
+        append_action(&mut wal, &mut sm, "b")?;
+        sync_flush(&mut wal)?;
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (_wal, sm) = open_wal(&config, calls)?;
+    assert_eq!(vec!["a", "b"], sm.values);
+
+    Ok(())
+}
+
+#[test]
 fn test_worker_failure_wakes_waiter_and_fails_later_waits()
 -> Result<(), io::Error> {
     let (_td, config) = temp_config();

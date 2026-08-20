@@ -87,8 +87,10 @@ where Rec: Encode
         chunk_id: ChunkId,
     ) -> Result<Arc<File>, io::Error> {
         let path = config.chunk_path(chunk_id);
+        // Append mode keeps every write at the end of the file, so a stray
+        // seek on this shared file description cannot misplace one.
         let f = OpenOptions::new()
-            .write(true)
+            .append(true)
             .read(true)
             .create_new(true)
             .open(path)?;

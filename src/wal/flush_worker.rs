@@ -344,7 +344,6 @@ where W: WalTypes
         let f = &mut files[0];
         f.f.sync_data()?;
         f.on_persisted.call(ChunkPersisted {
-            file: f.f.clone(),
             starting_offset: f.starting_offset,
             synced_offset: offset,
         });
