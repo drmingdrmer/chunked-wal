@@ -1,4 +1,5 @@
 use std::format;
+use std::io;
 use std::time::Duration;
 
 use crate::ChunkId;
@@ -105,6 +106,16 @@ impl Config {
             .max(1)
     }
 
+    /// Makes pending changes to the WAL directory itself durable.
+    ///
+    /// Synchronizing a chunk file only persists its contents. Until the
+    /// directory is synchronized too, a newly created chunk file name or a
+    /// removed one may not survive power loss.
+    pub fn sync_dir(&self) -> Result<(), io::Error> {
+        let directory = std::fs::File::open(&self.dir)?;
+        directory.sync_all()
+    }
+
     /// Returns the full path for a given chunk ID
     pub fn chunk_path(&self, chunk_id: ChunkId) -> String {
         let file_name = Self::chunk_file_name(chunk_id);
@@ -167,6 +178,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::time::Duration;
 
     use super::Config;
@@ -198,6 +210,21 @@ mod tests {
         assert!(!config.truncate_incomplete_record());
         assert_eq!(Duration::from_millis(9), config.flush_batch_wait());
         assert_eq!(1, config.flush_batch_max_items());
+    }
+
+    #[test]
+    fn test_sync_dir() -> Result<(), io::Error> {
+        let td = tempfile::tempdir()?;
+        let config = Config::new(td.path().to_str().unwrap());
+
+        config.sync_dir()?;
+
+        let missing_dir = format!("{}/absent", config.dir);
+        let missing = Config::new(missing_dir);
+        let err = missing.sync_dir().unwrap_err();
+        assert_eq!(io::ErrorKind::NotFound, err.kind());
+
+        Ok(())
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::time::Instant;
 use log::debug;
 use log::info;
 
+use crate::Config;
 use crate::WalTypes;
 use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
 use crate::wal::batch_metrics::BatchMetrics;
@@ -105,8 +106,7 @@ where W: WalTypes
     rx: Receiver<SeqRequest<W>>,
     files: Vec<FileEntry<W>>,
     metrics: Arc<AtomicFlushMetrics>,
-    flush_batch_wait: Duration,
-    flush_batch_max_items: usize,
+    config: Arc<Config>,
     worker_state: Arc<WorkerState>,
 }
 
@@ -128,15 +128,13 @@ where W: WalTypes
         file_entry: FileEntry<W>,
         worker_state: Arc<WorkerState>,
         metrics: Arc<AtomicFlushMetrics>,
-        flush_batch_wait: Duration,
-        flush_batch_max_items: usize,
+        config: Arc<Config>,
     ) -> Self {
         Self {
             rx,
             files: vec![file_entry],
             metrics,
-            flush_batch_wait,
-            flush_batch_max_items,
+            config,
             worker_state,
         }
     }
@@ -151,7 +149,8 @@ where W: WalTypes
     fn run_inner(&mut self) -> Result<(), io::Error> {
         loop {
             // Write requests should be batched to maximize throughput.
-            let mut batch = WriteBatch::new(self.flush_batch_max_items);
+            let mut batch =
+                WriteBatch::new(self.config.flush_batch_max_items());
 
             let req = self.rx.recv();
             let Ok(seq_req) = req else {
@@ -258,7 +257,7 @@ where W: WalTypes
 
     fn collect_write_batch(&self, batch: &mut WriteBatch<W>) -> Duration {
         let loop_started_at = Instant::now();
-        let loop_deadline = loop_started_at + self.flush_batch_wait;
+        let loop_deadline = loop_started_at + self.config.flush_batch_wait();
 
         while batch.last_non_flush.is_none()
             && batch.writes.len() < batch.max_size
@@ -312,8 +311,14 @@ where W: WalTypes
             }
             WorkerRequest::RemoveChunks { chunk_paths } => {
                 info!("FlushWorker: RemoveChunks: {:?}", chunk_paths);
+                let removed_any = !chunk_paths.is_empty();
                 for path in chunk_paths {
                     std::fs::remove_file(path)?;
+                }
+                if removed_any {
+                    // Commit the unlinks so a removed chunk cannot reappear
+                    // after power loss.
+                    self.config.sync_dir()?;
                 }
             }
         }
@@ -425,6 +430,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use crate::Config;
     use crate::WalTypes;
     use crate::wal::atomic_flush_metrics::AtomicFlushMetrics;
     use crate::wal::flush_request::SeqRequest;
@@ -447,12 +453,15 @@ mod tests {
         rx: Receiver<SeqRequest<TestWal>>,
         flush_batch_wait: Duration,
     ) -> FlushWorker<TestWal> {
+        let mut config = Config::new("no-such-dir");
+        config.flush_batch_wait = Some(flush_batch_wait);
+        config.flush_batch_max_items = Some(8);
+
         FlushWorker {
             rx,
             files: Vec::new(),
             metrics: Arc::new(AtomicFlushMetrics::default()),
-            flush_batch_wait,
-            flush_batch_max_items: 8,
+            config: Arc::new(config),
             worker_state: Arc::new(WorkerState::new()),
         }
     }

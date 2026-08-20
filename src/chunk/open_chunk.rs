@@ -93,6 +93,10 @@ where Rec: Encode
             .create_new(true)
             .open(path)?;
 
+        // Commit the new file name before any of its records can be
+        // acknowledged as durable.
+        config.sync_dir()?;
+
         Ok(Arc::new(f))
     }
 

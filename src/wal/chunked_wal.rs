@@ -235,8 +235,7 @@ where W: WalTypes
             file_entry,
             worker_state.clone(),
             flush_metrics.clone(),
-            config.flush_batch_wait(),
-            config.flush_batch_max_items(),
+            config.clone(),
         );
 
         worker.spawn();
@@ -299,9 +298,7 @@ where W: WalTypes
 
             let path = config.chunk_path(chunk_id);
             std::fs::remove_file(path)?;
-
-            let directory = std::fs::File::open(&config.dir)?;
-            directory.sync_all()?;
+            config.sync_dir()?;
 
             chunk_ids.pop();
         }
