@@ -8,6 +8,9 @@ test:
 build:
 	cargo build --release
 
+bench:
+	cargo bench
+
 check:
 	RUSTFLAGS="-D warnings" cargo check
 
@@ -29,4 +32,4 @@ coverage:
 clean:
 	cargo clean
 
-.PHONY: all test build check lint fmt clippy doc coverage clean
+.PHONY: all test build bench check lint fmt clippy doc coverage clean

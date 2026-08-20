@@ -24,3 +24,7 @@ thiserror = { version = "1.0.64" }
 
 [dev-dependencies]
 tempfile = { version = "3.4.0" }
+
+[[bench]]
+name = "wal"
+harness = false
