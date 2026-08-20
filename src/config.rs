@@ -13,6 +13,12 @@ const DEFAULT_FLUSH_BATCH_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_FLUSH_BATCH_MAX_ITEMS: usize = 2048;
 const DEFAULT_FLUSH_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+/// Largest accepted `read_buffer_size`.
+///
+/// The buffer only serves a sequential replay of one chunk, so a value this
+/// large is already far past useful and is more likely a unit mistake.
+const MAX_READ_BUFFER_SIZE: usize = 1024 * 1024 * 1024;
+
 /// Configuration for chunked WAL.
 ///
 /// This struct holds directory, chunk, recovery, and flush batching settings.
@@ -47,7 +53,7 @@ pub struct Config {
 
     /// Maximum number of write requests to include in one flush batch.
     ///
-    /// Defaults to 2048. Values smaller than 1 are treated as 1.
+    /// Defaults to 2048.
     pub flush_batch_max_items: Option<usize>,
 
     /// Maximum number of bytes of queued write requests held in memory.
@@ -114,16 +120,56 @@ impl Config {
 
     /// Returns the maximum number of write requests in one flush batch.
     pub fn flush_batch_max_items(&self) -> usize {
-        self.flush_batch_max_items
-            .unwrap_or(DEFAULT_FLUSH_BATCH_MAX_ITEMS)
-            .max(1)
+        self.flush_batch_max_items.unwrap_or(DEFAULT_FLUSH_BATCH_MAX_ITEMS)
     }
 
     /// Returns the maximum bytes of queued write requests held in memory.
     pub fn flush_queue_max_bytes(&self) -> usize {
-        self.flush_queue_max_bytes
-            .unwrap_or(DEFAULT_FLUSH_QUEUE_MAX_BYTES)
-            .max(1)
+        self.flush_queue_max_bytes.unwrap_or(DEFAULT_FLUSH_QUEUE_MAX_BYTES)
+    }
+
+    /// Rejects settings that cannot produce a working WAL.
+    ///
+    /// Opening or dumping a WAL validates first, so a bad value fails there
+    /// instead of turning into a silent empty read, a chunk that is full the
+    /// moment it is created, or a flush batch that holds nothing.
+    pub fn validate(&self) -> Result<(), io::Error> {
+        if self.dir.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Config::dir is empty",
+            ));
+        }
+
+        Self::reject_zero("read_buffer_size", self.read_buffer_size)?;
+        Self::reject_zero("chunk_max_records", self.chunk_max_records)?;
+        Self::reject_zero("chunk_max_size", self.chunk_max_size)?;
+        Self::reject_zero("flush_batch_max_items", self.flush_batch_max_items)?;
+        Self::reject_zero("flush_queue_max_bytes", self.flush_queue_max_bytes)?;
+
+        let read_buffer_size = self.read_buffer_size();
+        if read_buffer_size > MAX_READ_BUFFER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Config::read_buffer_size {} exceeds the {} byte limit",
+                    read_buffer_size, MAX_READ_BUFFER_SIZE
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn reject_zero(name: &str, value: Option<usize>) -> Result<(), io::Error> {
+        if value != Some(0) {
+            return Ok(());
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Config::{} is 0", name),
+        ))
     }
 
     /// Makes pending changes to the WAL directory itself durable.
@@ -202,6 +248,7 @@ mod tests {
     use std::time::Duration;
 
     use super::Config;
+    use super::MAX_READ_BUFFER_SIZE;
     use crate::ChunkId;
 
     #[test]
@@ -223,16 +270,80 @@ mod tests {
         let mut config = Config::new_full("wal-dir", Some(1), Some(2), Some(3));
         config.truncate_incomplete_record = Some(false);
         config.flush_batch_wait = Some(Duration::from_millis(9));
-        config.flush_batch_max_items = Some(0);
-        config.flush_queue_max_bytes = Some(0);
+        config.flush_batch_max_items = Some(4);
+        config.flush_queue_max_bytes = Some(5);
 
         assert_eq!(1, config.read_buffer_size());
         assert_eq!(2, config.chunk_max_records());
         assert_eq!(3, config.chunk_max_size());
         assert!(!config.truncate_incomplete_record());
         assert_eq!(Duration::from_millis(9), config.flush_batch_wait());
-        assert_eq!(1, config.flush_batch_max_items());
-        assert_eq!(1, config.flush_queue_max_bytes());
+        assert_eq!(4, config.flush_batch_max_items());
+        assert_eq!(5, config.flush_queue_max_bytes());
+    }
+
+    #[test]
+    fn test_validate_accepts_defaults_and_overrides() -> Result<(), io::Error> {
+        Config::new("wal-dir").validate()?;
+
+        let mut config = Config::new_full("wal-dir", Some(1), Some(2), Some(3));
+        config.flush_batch_max_items = Some(4);
+        config.flush_queue_max_bytes = Some(5);
+        config.validate()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_dir() {
+        let err = Config::new("").validate().unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert_eq!("Config::dir is empty", err.to_string());
+    }
+
+    fn assert_zero_rejected(config: &Config, name: &str) {
+        let err = config.validate().unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert_eq!(format!("Config::{name} is 0"), err.to_string());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_sizes() {
+        let mut config = Config::new("wal-dir");
+        config.read_buffer_size = Some(0);
+        assert_zero_rejected(&config, "read_buffer_size");
+
+        let mut config = Config::new("wal-dir");
+        config.chunk_max_records = Some(0);
+        assert_zero_rejected(&config, "chunk_max_records");
+
+        let mut config = Config::new("wal-dir");
+        config.chunk_max_size = Some(0);
+        assert_zero_rejected(&config, "chunk_max_size");
+
+        let mut config = Config::new("wal-dir");
+        config.flush_batch_max_items = Some(0);
+        assert_zero_rejected(&config, "flush_batch_max_items");
+
+        let mut config = Config::new("wal-dir");
+        config.flush_queue_max_bytes = Some(0);
+        assert_zero_rejected(&config, "flush_queue_max_bytes");
+    }
+
+    #[test]
+    fn test_validate_rejects_oversized_read_buffer() {
+        let mut config = Config::new("wal-dir");
+        config.read_buffer_size = Some(MAX_READ_BUFFER_SIZE + 1);
+
+        let err = config.validate().unwrap_err();
+
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert_eq!(
+            "Config::read_buffer_size 1073741825 exceeds the 1073741824 byte limit",
+            err.to_string()
+        );
     }
 
     #[test]

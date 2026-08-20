@@ -111,6 +111,8 @@ where W: WalTypes
     where
         SM: StateMachine<W>,
     {
+        config.validate()?;
+
         let mut chunk_ids = Self::load_chunk_ids(&config, &dir_lock)?;
         Self::remove_incomplete_tail_chunks(&config, &mut chunk_ids)?;
 
@@ -184,6 +186,8 @@ where W: WalTypes
             Result<(Segment, WALRecord<W>), io::Error>,
         ) -> Result<(), io::Error>,
     {
+        config.validate()?;
+
         let chunk_ids = Self::load_chunk_ids(config, _dir_lock)?;
         for chunk_id in chunk_ids {
             let it = Chunk::<WALRecord<W>>::dump(config, chunk_id)?;
