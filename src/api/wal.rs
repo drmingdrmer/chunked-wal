@@ -26,10 +26,18 @@ use crate::types::Segment;
 pub trait WAL<Rec> {
     // type StateMachine: StateMachine<Rec>;
 
-    /// Appends a new record to the write-ahead log.
+    /// Encodes a new record into the write-ahead log's in-memory buffer.
     ///
-    /// This method provides durability by ensuring that records are written to
-    /// persistent storage before returning.
+    /// This method does not touch the file: it appends the encoded bytes to a
+    /// pending buffer and advances the in-memory record index. Returning
+    /// `Ok(())` therefore says nothing about durability, and the record is
+    /// lost if the process dies before the buffer is written and synced.
+    ///
+    /// To make appended records durable, hand the pending buffer to the flush
+    /// worker with a sync request and wait for its callback. For
+    /// [`ChunkedWal`], that is `send_pending(true, Some(callback))`.
+    ///
+    /// [`ChunkedWal`]: crate::ChunkedWal
     fn append(&mut self, rec: &Rec) -> Result<(), io::Error>;
 
     /// Returns the segment representing the last record in the write-ahead log.
