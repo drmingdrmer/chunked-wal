@@ -3,11 +3,13 @@ use std::io;
 use std::io::IoSlice;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::RecvTimeoutError;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -119,13 +121,13 @@ impl<W> FlushWorker<W>
 where W: WalTypes
 {
     /// When starting, there is at most one open chunk file that is not sync.
-    pub(crate) fn spawn(self) {
+    pub(crate) fn spawn(self) -> JoinHandle<()> {
         std::thread::Builder::new()
             .name("chunked_wal_flush_worker".to_string())
             .spawn(move || {
                 self.run();
             })
-            .expect("Failed to start sync worker thread");
+            .expect("Failed to start sync worker thread")
     }
 
     pub(crate) fn new(
@@ -144,18 +146,32 @@ where W: WalTypes
         }
     }
 
+    /// Runs the worker and records any failure in the shared worker state.
+    ///
+    /// User code runs on this thread through the write and chunk-persisted
+    /// callbacks. Catching its panics keeps a panicking callback from
+    /// unwinding the thread silently, which would leave every
+    /// `wait_worker_idle` caller blocked forever.
     fn run(mut self) {
-        let res = self.run_inner();
+        let res =
+            std::panic::catch_unwind(AssertUnwindSafe(|| self.run_inner()));
 
         // A stopped worker never frees queued write memory again. Release it
         // so a sender blocked on the byte limit wakes and sees the closed
         // channel instead of waiting forever.
         self.worker_state.queued_bytes().release_all();
 
-        if let Err(e) = res {
-            log::error!("FlushWorker failed: {}", e);
-            self.worker_state.fail(e);
-        }
+        let err = match res {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e,
+            Err(payload) => io::Error::other(format!(
+                "FlushWorker panicked: {}",
+                panic_message(payload.as_ref())
+            )),
+        };
+
+        log::error!("FlushWorker failed: {}", err);
+        self.worker_state.fail(err);
     }
 
     fn run_inner(&mut self) -> Result<(), io::Error> {
@@ -366,6 +382,19 @@ where W: WalTypes
 
         Ok(())
     }
+}
+
+/// Renders a caught panic payload as text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "unknown panic payload".to_string()
 }
 
 fn write_batch_vectored<W>(

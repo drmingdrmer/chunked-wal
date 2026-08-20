@@ -831,6 +831,91 @@ fn test_writes_ignore_a_moved_file_cursor() -> Result<(), io::Error> {
 }
 
 #[test]
+fn test_shutdown_persists_pending_records() -> Result<(), io::Error> {
+    let (_td, config) = temp_config();
+
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        append_action(&mut wal, &mut sm, "b")?;
+
+        wal.shutdown()?;
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (_wal, sm) = open_wal(&config, calls)?;
+    assert_eq!(vec!["a", "b"], sm.values);
+
+    Ok(())
+}
+
+#[test]
+fn test_drop_persists_pending_records() -> Result<(), io::Error> {
+    let (_td, config) = temp_config();
+
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (_wal, sm) = open_wal(&config, calls)?;
+    assert_eq!(vec!["a"], sm.values);
+
+    Ok(())
+}
+
+#[test]
+fn test_shutdown_rejects_later_requests_and_repeats() -> Result<(), io::Error> {
+    let (_td, config) = temp_config();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+    append_action(&mut wal, &mut sm, "a")?;
+    wal.shutdown()?;
+
+    let err = wal.send_pending(true, None).unwrap_err();
+    assert_eq!(io::ErrorKind::Other, err.kind());
+    assert_eq!("Failed to send request: WAL is shut down", err.to_string());
+
+    let err = wal.send_remove_chunks(vec![ChunkId(0)]).unwrap_err();
+    assert_eq!("Failed to send request: WAL is shut down", err.to_string());
+
+    wal.shutdown()?;
+
+    Ok(())
+}
+
+#[test]
+fn test_callback_panic_fails_worker_instead_of_blocking_waiters()
+-> Result<(), io::Error> {
+    let (_td, config) = temp_config();
+
+    let on_chunk_persisted: ChunkPersistedFn<TestWal> =
+        Arc::new(|_persisted, _checkpoint| panic!("callback panic"));
+
+    let mut sm = TestStateMachine::default();
+    let mut wal = ChunkedWal::open(
+        Arc::new(config.clone()),
+        &mut sm,
+        on_chunk_persisted,
+    )?;
+
+    append_action(&mut wal, &mut sm, "a")?;
+    wal.send_pending(true, None)?;
+
+    let err = wal.wait_worker_idle().unwrap_err();
+    assert_eq!(io::ErrorKind::Other, err.kind());
+    assert_eq!("FlushWorker panicked: callback panic", err.to_string());
+
+    Ok(())
+}
+
+#[test]
 fn test_worker_failure_wakes_waiter_and_fails_later_waits()
 -> Result<(), io::Error> {
     let (_td, config) = temp_config();

@@ -3,6 +3,7 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
+use std::thread::JoinHandle;
 
 use codeq::OffsetSize;
 use log::info;
@@ -59,6 +60,11 @@ where W: WalTypes
 
     /// Shared with `FlushWorker`; stores aggregated flush metrics.
     flush_metrics: Arc<AtomicFlushMetrics>,
+
+    /// Handle of the flush worker thread, taken by [`ChunkedWal::shutdown`].
+    ///
+    /// `None` once the worker has been joined.
+    worker_handle: Option<JoinHandle<()>>,
 
     /// Holds the exclusive lock on the WAL directory for this WAL instance.
     _dir_lock: WalLock,
@@ -242,7 +248,7 @@ where W: WalTypes
             config.clone(),
         );
 
-        worker.spawn();
+        let worker_handle = worker.spawn();
 
         let flush_client = FlushClient::new(flush_tx, worker_state);
 
@@ -253,6 +259,7 @@ where W: WalTypes
             flush_client,
             on_chunk_persisted,
             flush_metrics,
+            worker_handle: Some(worker_handle),
             _dir_lock: dir_lock,
         }
     }
@@ -497,6 +504,37 @@ where W: WalTypes
         self.flush_client.wait_idle()
     }
 
+    /// Closes the WAL: writes and syncs pending records, drains the request
+    /// queue, and joins the flush worker.
+    ///
+    /// Records appended but never handed to the worker are written and
+    /// synchronized here, so a clean shutdown loses nothing that
+    /// [`WAL::append`] accepted. Afterwards every request-sending method
+    /// fails, and the WAL directory lock is only released once the worker
+    /// thread is gone.
+    ///
+    /// Dropping a `ChunkedWal` runs the same sequence, but a caller that
+    /// wants to observe a write or sync failure must call this method.
+    /// Calling it more than once is harmless.
+    pub fn shutdown(&mut self) -> Result<(), io::Error> {
+        let Some(handle) = self.worker_handle.take() else {
+            return Ok(());
+        };
+
+        let flush_res = self.send_pending(true, None);
+
+        // Drop the sender so the worker returns once its queue is drained.
+        self.flush_client.close();
+
+        let join_res = handle
+            .join()
+            .map_err(|_panic| io::Error::other("flush worker thread panicked"));
+
+        flush_res?;
+        join_res?;
+        self.flush_client.wait_idle()
+    }
+
     pub fn flush_metrics(&self) -> FlushMetrics {
         self.flush_metrics.snapshot()
     }
@@ -675,6 +713,17 @@ where W: WalTypes
         };
 
         Ok(record)
+    }
+}
+
+impl<W> Drop for ChunkedWal<W>
+where W: WalTypes
+{
+    /// Joins the flush worker before the WAL directory lock is released.
+    fn drop(&mut self) {
+        if let Err(e) = self.shutdown() {
+            log::error!("ChunkedWal shutdown failed: {}", e);
+        }
     }
 }
 

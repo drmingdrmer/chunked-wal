@@ -13,7 +13,9 @@ pub(super) struct FlushClient<W>
 where W: WalTypes
 {
     /// Channel for sending ordered requests to the flush worker.
-    tx: SyncSender<SeqRequest<W>>,
+    ///
+    /// `None` after [`FlushClient::close`], which rejects further requests.
+    tx: Option<SyncSender<SeqRequest<W>>>,
 
     /// Sequence number assigned to the most recent request.
     sent_seq: u64,
@@ -31,7 +33,7 @@ where W: WalTypes
         state: Arc<WorkerState>,
     ) -> Self {
         Self {
-            tx,
+            tx: Some(tx),
             sent_seq: 0,
             state,
         }
@@ -42,6 +44,12 @@ where W: WalTypes
         &mut self,
         req: WorkerRequest<W>,
     ) -> Result<(), io::Error> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(io::Error::other(
+                "Failed to send request: WAL is shut down",
+            ));
+        };
+
         // Reserve the request's memory before queueing it, so a slow worker
         // throttles the sender instead of letting queued data grow without
         // bound.
@@ -52,8 +60,7 @@ where W: WalTypes
         self.state.queued_bytes().acquire(reserved);
 
         self.sent_seq += 1;
-        let res = self
-            .tx
+        let res = tx
             .send(SeqRequest {
                 seq: self.sent_seq,
                 queued_at: Instant::now(),
@@ -68,6 +75,12 @@ where W: WalTypes
         }
 
         res
+    }
+
+    /// Rejects further requests and lets the worker stop once its queue is
+    /// drained.
+    pub(super) fn close(&mut self) {
+        self.tx = None;
     }
 
     /// Waits until the worker reaches the current sequence or reports failure.
