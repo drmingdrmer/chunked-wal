@@ -24,6 +24,13 @@ where W: WalTypes
         }
     }
 
+    /// Empties the batch while keeping the capacity of its write vector.
+    pub(crate) fn reset(&mut self) {
+        self.writes.clear();
+        self.max_seq = 0;
+        self.last_non_flush = None;
+    }
+
     pub(crate) fn push_seq_request(&mut self, seq_req: SeqRequest<W>) -> bool {
         let SeqRequest {
             seq,

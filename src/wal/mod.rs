@@ -10,6 +10,7 @@ pub(crate) mod file_entry;
 mod flush_client;
 pub(crate) mod flush_request;
 pub(crate) mod flush_worker;
+pub(crate) mod queued_bytes;
 pub(crate) mod queued_write;
 pub(crate) mod write_batch;
 

@@ -6,8 +6,12 @@ use crate::ChunkId;
 use crate::errors::InvalidChunkFileName;
 use crate::num;
 
+/// Buffer size for the sequential read that replays one chunk.
+const DEFAULT_READ_BUFFER_SIZE: usize = 64 * 1024 * 1024;
+
 const DEFAULT_FLUSH_BATCH_WAIT: Duration = Duration::from_millis(1);
 const DEFAULT_FLUSH_BATCH_MAX_ITEMS: usize = 2048;
+const DEFAULT_FLUSH_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Configuration for chunked WAL.
 ///
@@ -45,6 +49,14 @@ pub struct Config {
     ///
     /// Defaults to 2048. Values smaller than 1 are treated as 1.
     pub flush_batch_max_items: Option<usize>,
+
+    /// Maximum number of bytes of queued write requests held in memory.
+    ///
+    /// A request that would exceed this limit blocks its sender until the
+    /// flush worker has written earlier requests. Defaults to 64MB. One
+    /// request bigger than the whole limit is still accepted, once nothing
+    /// else is queued.
+    pub flush_queue_max_bytes: Option<usize>,
 }
 
 impl Config {
@@ -71,12 +83,13 @@ impl Config {
             truncate_incomplete_record: None,
             flush_batch_wait: None,
             flush_batch_max_items: None,
+            flush_queue_max_bytes: None,
         }
     }
 
     /// Returns the size of read buffer in bytes (defaults to 64MB)
     pub fn read_buffer_size(&self) -> usize {
-        self.read_buffer_size.unwrap_or(64 * 1024 * 1024)
+        self.read_buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE)
     }
 
     /// Returns the maximum number of records per chunk (defaults to 1M records)
@@ -103,6 +116,13 @@ impl Config {
     pub fn flush_batch_max_items(&self) -> usize {
         self.flush_batch_max_items
             .unwrap_or(DEFAULT_FLUSH_BATCH_MAX_ITEMS)
+            .max(1)
+    }
+
+    /// Returns the maximum bytes of queued write requests held in memory.
+    pub fn flush_queue_max_bytes(&self) -> usize {
+        self.flush_queue_max_bytes
+            .unwrap_or(DEFAULT_FLUSH_QUEUE_MAX_BYTES)
             .max(1)
     }
 
@@ -195,6 +215,7 @@ mod tests {
         assert!(config.truncate_incomplete_record());
         assert_eq!(Duration::from_millis(1), config.flush_batch_wait());
         assert_eq!(2048, config.flush_batch_max_items());
+        assert_eq!(64 * 1024 * 1024, config.flush_queue_max_bytes());
     }
 
     #[test]
@@ -203,6 +224,7 @@ mod tests {
         config.truncate_incomplete_record = Some(false);
         config.flush_batch_wait = Some(Duration::from_millis(9));
         config.flush_batch_max_items = Some(0);
+        config.flush_queue_max_bytes = Some(0);
 
         assert_eq!(1, config.read_buffer_size());
         assert_eq!(2, config.chunk_max_records());
@@ -210,6 +232,7 @@ mod tests {
         assert!(!config.truncate_incomplete_record());
         assert_eq!(Duration::from_millis(9), config.flush_batch_wait());
         assert_eq!(1, config.flush_batch_max_items());
+        assert_eq!(1, config.flush_queue_max_bytes());
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::wal::file_persisted::ChunkPersisted;
 use crate::wal::flush_request::FlushStat;
 use crate::wal::flush_request::SeqRequest;
 use crate::wal::flush_request::WorkerRequest;
+use crate::wal::queued_bytes::QueuedBytes;
 use crate::wal::queued_write::QueuedWrite;
 use crate::wal::write_batch::WriteBatch;
 
@@ -39,27 +40,31 @@ struct WorkerProgress {
     status: WorkerStatus,
 }
 
+/// Flow control shared by the WAL and its flush worker.
+///
+/// The WAL waits here for completion and failure reports, and for queued
+/// write memory to be freed.
 #[derive(Debug)]
 pub(crate) struct WorkerState {
     progress: Mutex<WorkerProgress>,
     changed: Condvar,
-}
-
-impl Default for WorkerState {
-    fn default() -> Self {
-        Self::new()
-    }
+    queued_bytes: QueuedBytes,
 }
 
 impl WorkerState {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(queue_max_bytes: usize) -> Self {
         Self {
             progress: Mutex::new(WorkerProgress {
                 done_seq: 0,
                 status: WorkerStatus::Running,
             }),
             changed: Condvar::new(),
+            queued_bytes: QueuedBytes::new(queue_max_bytes),
         }
+    }
+
+    pub(crate) fn queued_bytes(&self) -> &QueuedBytes {
+        &self.queued_bytes
     }
 
     pub(crate) fn done_seq(&self) -> u64 {
@@ -140,17 +145,26 @@ where W: WalTypes
     }
 
     fn run(mut self) {
-        if let Err(e) = self.run_inner() {
+        let res = self.run_inner();
+
+        // A stopped worker never frees queued write memory again. Release it
+        // so a sender blocked on the byte limit wakes and sees the closed
+        // channel instead of waiting forever.
+        self.worker_state.queued_bytes().release_all();
+
+        if let Err(e) = res {
             log::error!("FlushWorker failed: {}", e);
             self.worker_state.fail(e);
         }
     }
 
     fn run_inner(&mut self) -> Result<(), io::Error> {
+        // Write requests should be batched to maximize throughput. One batch
+        // serves every iteration so its write vector is allocated once.
+        let mut batch = WriteBatch::new(self.config.flush_batch_max_items());
+
         loop {
-            // Write requests should be batched to maximize throughput.
-            let mut batch =
-                WriteBatch::new(self.config.flush_batch_max_items());
+            batch.reset();
 
             let req = self.rx.recv();
             let Ok(seq_req) = req else {
@@ -172,6 +186,9 @@ where W: WalTypes
             let group_wait = self.collect_write_batch(&mut batch);
 
             debug!("batched write: {}", batch.writes.len());
+
+            let batch_bytes: usize =
+                batch.writes.iter().map(|w| w.write.data.len()).sum();
 
             let sync_result = {
                 // TODO: possible to use write_all_vectored()?
@@ -217,14 +234,10 @@ where W: WalTypes
                 sync_result
             };
 
-            let WriteBatch {
-                writes,
-                mut max_seq,
-                last_non_flush,
-                ..
-            } = batch;
+            let mut max_seq = batch.max_seq;
+            let last_non_flush = batch.last_non_flush.take();
 
-            for w in writes {
+            for w in batch.writes.drain(..) {
                 if let Some(cb) = w.write.callback {
                     match &sync_result {
                         Ok(()) => cb.send(Ok(())),
@@ -237,6 +250,8 @@ where W: WalTypes
                     }
                 }
             }
+
+            self.worker_state.queued_bytes().release(batch_bytes);
 
             sync_result?;
 
@@ -363,33 +378,32 @@ where
     const MAX_VECTORED_WRITE_SLICES: usize = 1024;
 
     for chunk in writes.chunks(MAX_VECTORED_WRITE_SLICES) {
-        let mut slices = chunk
+        let mut io_slices = chunk
             .iter()
             .filter(|w| !w.write.data.is_empty())
-            .map(|w| w.write.data.as_slice())
+            .map(|w| IoSlice::new(&w.write.data))
             .collect::<Vec<_>>();
 
-        if !slices.is_empty() {
-            write_all_vectored(file, &mut slices)?;
+        if !io_slices.is_empty() {
+            write_all_vectored(file, &mut io_slices)?;
         }
     }
 
     Ok(())
 }
 
+/// Writes every slice, resuming a partial write in place.
+///
+/// `IoSlice::advance_slices` trims the already-written prefix from the front
+/// of `io_slices`, so a partial write does not rebuild the slice list.
 fn write_all_vectored(
     file: &mut &File,
-    buffers: &mut [&[u8]],
+    io_slices: &mut [IoSlice<'_>],
 ) -> Result<(), io::Error> {
-    let mut start = 0;
+    let mut remaining = io_slices;
 
-    while start < buffers.len() {
-        let io_slices = buffers[start..]
-            .iter()
-            .map(|buffer| IoSlice::new(buffer))
-            .collect::<Vec<_>>();
-
-        let mut written = match file.write_vectored(&io_slices) {
+    while !remaining.is_empty() {
+        let written = match file.write_vectored(remaining) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -401,19 +415,7 @@ fn write_all_vectored(
             Err(e) => return Err(e),
         };
 
-        while written > 0 {
-            let len = buffers[start].len();
-            if written < len {
-                buffers[start] = &buffers[start][written..];
-                break;
-            }
-
-            written -= len;
-            start += 1;
-            if start == buffers.len() {
-                break;
-            }
-        }
+        IoSlice::advance_slices(&mut remaining, written);
     }
 
     Ok(())
@@ -461,7 +463,7 @@ mod tests {
             files: Vec::new(),
             metrics: Arc::new(AtomicFlushMetrics::default()),
             config: Arc::new(config),
-            worker_state: Arc::new(WorkerState::new()),
+            worker_state: Arc::new(WorkerState::new(1024)),
         }
     }
 
@@ -480,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_worker_state_waits_for_completion() -> Result<(), io::Error> {
-        let state = WorkerState::new();
+        let state = WorkerState::new(1024);
 
         state.complete(3);
 
@@ -492,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_worker_state_wait_returns_failure() {
-        let state = WorkerState::new();
+        let state = WorkerState::new(1024);
         let err = io::Error::new(io::ErrorKind::PermissionDenied, "no write");
 
         state.fail(err);

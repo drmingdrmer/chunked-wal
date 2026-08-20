@@ -42,8 +42,18 @@ where W: WalTypes
         &mut self,
         req: WorkerRequest<W>,
     ) -> Result<(), io::Error> {
+        // Reserve the request's memory before queueing it, so a slow worker
+        // throttles the sender instead of letting queued data grow without
+        // bound.
+        let reserved = match &req {
+            WorkerRequest::Write(write) => write.data.len(),
+            _ => 0,
+        };
+        self.state.queued_bytes().acquire(reserved);
+
         self.sent_seq += 1;
-        self.tx
+        let res = self
+            .tx
             .send(SeqRequest {
                 seq: self.sent_seq,
                 queued_at: Instant::now(),
@@ -51,7 +61,13 @@ where W: WalTypes
             })
             .map_err(|e| {
                 io::Error::other(format!("Failed to send request: {}", e))
-            })
+            });
+
+        if res.is_err() {
+            self.state.queued_bytes().release(reserved);
+        }
+
+        res
     }
 
     /// Waits until the worker reaches the current sequence or reports failure.

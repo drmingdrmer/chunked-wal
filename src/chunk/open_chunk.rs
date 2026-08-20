@@ -26,8 +26,14 @@ impl<Rec> OpenChunk<Rec> {
         }
     }
 
+    /// Hands the encoded pending records to the caller.
+    ///
+    /// The replacement buffer keeps the capacity the previous one reached, so
+    /// a steady batch size stops re-growing the buffer on every flush.
     pub(crate) fn take_pending_data(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending_data)
+        let capacity = self.pending_data.capacity();
+        let replacement = Vec::with_capacity(capacity);
+        std::mem::replace(&mut self.pending_data, replacement)
     }
 }
 

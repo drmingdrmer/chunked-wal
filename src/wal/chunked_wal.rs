@@ -225,7 +225,8 @@ where W: WalTypes
             ),
         );
 
-        let worker_state = Arc::new(WorkerState::new());
+        let worker_state =
+            Arc::new(WorkerState::new(config.flush_queue_max_bytes()));
         let flush_metrics = Arc::new(AtomicFlushMetrics::default());
 
         let (flush_tx, rx) = std::sync::mpsc::sync_channel(1024);

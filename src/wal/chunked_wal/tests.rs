@@ -776,6 +776,34 @@ fn test_flush_without_sync_writes_without_advancing_sync_id()
 }
 
 #[test]
+fn test_bounded_flush_queue_persists_every_record() -> Result<(), io::Error> {
+    let (_td, mut config) = temp_config();
+    // One byte forces every send to wait for the worker to drain the queue,
+    // so a byte reservation the worker forgets to release would deadlock.
+    config.flush_queue_max_bytes = Some(1);
+
+    let expected = (0..64).map(|i| format!("v{i}")).collect::<Vec<String>>();
+
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        for value in &expected {
+            append_action(&mut wal, &mut sm, value)?;
+            wal.send_pending(false, None)?;
+        }
+
+        sync_flush(&mut wal)?;
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (_wal, sm) = open_wal(&config, calls)?;
+    assert_eq!(expected, sm.values);
+
+    Ok(())
+}
+
+#[test]
 fn test_writes_ignore_a_moved_file_cursor() -> Result<(), io::Error> {
     let (_td, config) = temp_config();
 
