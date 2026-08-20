@@ -125,7 +125,8 @@ where W: WalTypes
     where
         SM: StateMachine<W>,
     {
-        let chunk_ids = Self::load_chunk_ids(&config, &dir_lock)?;
+        let mut chunk_ids = Self::load_chunk_ids(&config, &dir_lock)?;
+        Self::remove_incomplete_tail_chunks(&config, &mut chunk_ids)?;
 
         let mut closed = BTreeMap::new();
         let mut prev_end_offset = None;
@@ -286,6 +287,65 @@ where W: WalTypes
         }
 
         Ok(())
+    }
+
+    /// Removes successor files left uncommitted by interrupted rotation.
+    ///
+    /// The worker writes a successor's first record only after syncing its
+    /// predecessor, so a trailing chunk without that record can be discarded.
+    fn remove_incomplete_tail_chunks(
+        config: &Config,
+        chunk_ids: &mut Vec<ChunkId>,
+    ) -> Result<(), io::Error> {
+        loop {
+            let Some(chunk_id) = chunk_ids.last().copied() else {
+                return Ok(());
+            };
+
+            if Self::has_complete_initial_record(config, chunk_id)? {
+                return Ok(());
+            }
+
+            log::warn!(
+                "Removing trailing chunk without complete initial record: \
+                 {chunk_id}"
+            );
+
+            let path = config.chunk_path(chunk_id);
+            std::fs::remove_file(path)?;
+
+            let directory = std::fs::File::open(&config.dir)?;
+            directory.sync_all()?;
+
+            chunk_ids.pop();
+        }
+    }
+
+    fn has_complete_initial_record(
+        config: &Config,
+        chunk_id: ChunkId,
+    ) -> Result<bool, io::Error> {
+        let file = Chunk::<WALRecord<W>>::open_chunk_file(config, chunk_id)?;
+        let mut records = Chunk::<WALRecord<W>>::load_records_iter(
+            config,
+            Arc::new(file),
+            chunk_id,
+        )?;
+
+        let Some(first) = records.next() else {
+            return Ok(false);
+        };
+
+        match first {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     fn reopen_last_closed(
@@ -566,8 +626,6 @@ where W: WalTypes
         let checkpoint = state_machine.checkpoint();
         let checkpoint = Arc::new(checkpoint);
 
-        // New open chunk without initial checkpoint record. The checkpoint will
-        // be added after the file is persisted.
         let new_open = {
             let chunk_id = ChunkId(offset.0);
             OpenChunk::<WALRecord<W>>::create_empty(config, chunk_id)?
@@ -582,11 +640,11 @@ where W: WalTypes
             ),
         )))?;
 
-        // install the new open
         let old_open = std::mem::replace(&mut self.open, new_open);
 
-        // Add the initial checkpoint record.
         self.append(&WALRecord::Checkpoint(checkpoint.as_ref().clone()))?;
+        // FIFO writes the checkpoint after the predecessor sync. Until then,
+        // recovery treats this successor as uncommitted.
         self.send_pending(false, None)?;
 
         let chunk = old_open.chunk;
@@ -655,6 +713,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc::SyncSender;
     use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
 
     use codeq::Decode;
     use codeq::Encode;
@@ -910,6 +969,125 @@ mod tests {
             records
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_recovers_crash_before_predecessor_sync()
+    -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.chunk_max_records = Some(3);
+
+        // Pause the worker after syncing the durable prefix. The next rotation
+        // can then create its successor before writing the predecessor's tail.
+        let (reached_tx, reached_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        let gate = Arc::new(Mutex::new(Some((reached_tx, resume_rx))));
+        let on_chunk_persisted: ChunkPersistedFn<TestWal> = Arc::new({
+            let gate = gate.clone();
+            move |_persisted, _checkpoint| {
+                let pending = {
+                    let mut gate = gate.lock().unwrap();
+                    gate.take()
+                };
+                let Some((reached_tx, resume_rx)) = pending else {
+                    return;
+                };
+                if reached_tx.send(()).is_ok() {
+                    let _ = resume_rx.recv();
+                }
+            }
+        });
+
+        let mut sm = TestStateMachine::default();
+        let mut wal = ChunkedWal::open(
+            Arc::new(config.clone()),
+            &mut sm,
+            on_chunk_persisted,
+        )?;
+        append_action(&mut wal, &mut sm, "durable")?;
+        wal.send_pending(true, None)?;
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        // Rotate while the worker is blocked, producing the original failure
+        // state: the predecessor ends before the empty successor's chunk ID.
+        append_action(&mut wal, &mut sm, "not-durable")?;
+        let predecessor_id = *wal.closed.last_key_value().unwrap().0;
+        let successor_id = wal.open_chunk_id();
+        let predecessor_size =
+            std::fs::metadata(config.chunk_path(predecessor_id))?.len();
+        let predecessor_end = predecessor_id.offset() + predecessor_size;
+        assert!(predecessor_end < successor_id.offset());
+        assert_eq!(
+            0,
+            std::fs::metadata(config.chunk_path(successor_id))?.len()
+        );
+
+        // Preserve the inconsistent files as a crash image before allowing the
+        // original worker to finish its queued writes.
+        let (_crash_td, mut crash_config) = temp_config();
+        crash_config.truncate_incomplete_record = Some(false);
+        for chunk_id in [predecessor_id, successor_id] {
+            std::fs::copy(
+                config.chunk_path(chunk_id),
+                crash_config.chunk_path(chunk_id),
+            )?;
+        }
+
+        resume_tx
+            .send(())
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        wal.wait_worker_idle()?;
+
+        // Recovery must remove the empty successor and replay only the exact
+        // durable prefix from its predecessor.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (crash_wal, crash_sm) = open_wal(&crash_config, calls)?;
+        assert_eq!(vec!["durable"], crash_sm.values);
+        assert_eq!(predecessor_id, crash_wal.open_chunk_id());
+        drop(crash_wal);
+
+        let lock = ChunkedWal::<TestWal>::acquire_lock(&crash_config)?;
+        let chunk_ids =
+            ChunkedWal::<TestWal>::load_chunk_ids(&crash_config, &lock)?;
+        assert_eq!(vec![predecessor_id], chunk_ids);
+        Ok(())
+    }
+
+    #[test]
+    fn test_reopen_removes_incomplete_tail_chunks() -> Result<(), io::Error> {
+        let (_td, mut config) = temp_config();
+        config.truncate_incomplete_record = Some(false);
+
+        let first_tail_id = {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (mut wal, mut sm) = open_wal(&config, calls)?;
+            append_action(&mut wal, &mut sm, "a")?;
+            sync_flush(&mut wal)?;
+            ChunkId(wal.open.chunk.global_end())
+        };
+
+        let mut checkpoint = Vec::new();
+        WALRecord::<TestWal>::Checkpoint("a".to_string())
+            .encode(&mut checkpoint)?;
+        let second_tail_id =
+            ChunkId(first_tail_id.offset() + checkpoint.len() as u64);
+        checkpoint.pop();
+
+        std::fs::write(config.chunk_path(first_tail_id), checkpoint)?;
+        std::fs::write(config.chunk_path(second_tail_id), [])?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (wal, sm) = open_wal(&config, calls)?;
+        assert_eq!(vec!["a"], sm.values);
+        assert_eq!(ChunkId(0), wal.open_chunk_id());
+        drop(wal);
+
+        let lock = ChunkedWal::<TestWal>::acquire_lock(&config)?;
+        let chunk_ids = ChunkedWal::<TestWal>::load_chunk_ids(&config, &lock)?;
+        assert_eq!(vec![ChunkId(0)], chunk_ids);
         Ok(())
     }
 
