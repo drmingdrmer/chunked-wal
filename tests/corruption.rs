@@ -319,13 +319,7 @@ fn test_single_bit_corruption_never_panics_or_invents_records()
 ///
 /// Truncation is disabled here so the assertion covers chunk removal alone: a
 /// tail that recovery only truncated would still leave its file behind.
-///
-/// Ignored while the defect is open: `has_complete_initial_record` maps only
-/// `UnexpectedEof` to "remove this chunk", and decoding a zero-filled record
-/// fails with `InvalidData` instead. Removing `#[ignore]` is the acceptance
-/// check for that fix.
 #[test]
-#[ignore = "open defect: zero-filled tail chunk is not removed at open"]
 fn test_zero_filled_tail_chunk_is_removed() -> Result<(), io::Error> {
     let td = tempfile::tempdir()?;
     let images = build_wal_image(td.path())?;

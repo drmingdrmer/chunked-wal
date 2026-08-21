@@ -273,7 +273,7 @@ where Rec: Decode + 'static
     /// bytes after the given offset are zeros. This is particularly useful
     /// for detecting incomplete or interrupted writes where the remaining
     /// space may have been zero-filled.
-    fn verify_trailing_zeros(
+    pub(crate) fn verify_trailing_zeros(
         file: Arc<File>,
         mut start_offset: u64,
         chunk_id: ChunkId,

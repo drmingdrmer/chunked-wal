@@ -320,26 +320,43 @@ where W: WalTypes
         chunk_id: ChunkId,
     ) -> Result<bool, io::Error> {
         let file = Chunk::<WALRecord<W>>::open_chunk_file(config, chunk_id)?;
-        let mut records = Chunk::<WALRecord<W>>::load_records_iter(
-            config,
-            Arc::new(file),
-            chunk_id,
-        )?;
+        let file = Arc::new(file);
 
-        let Some(first) = records.next() else {
+        let first = {
+            let mut records = Chunk::<WALRecord<W>>::load_records_iter(
+                config,
+                file.clone(),
+                chunk_id,
+            )?;
+            records.next()
+        };
+
+        let Some(first) = first else {
             return Ok(false);
         };
 
-        match first {
-            Ok(_) => Ok(true),
-            Err(error) => {
-                if error.kind() == io::ErrorKind::UnexpectedEof {
-                    Ok(false)
-                } else {
-                    Err(error)
-                }
-            }
+        let error = match first {
+            Ok(_) => return Ok(true),
+            Err(error) => error,
+        };
+
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            return Ok(false);
         }
+
+        // An interrupted rotation does not always leave a short file. On ext4
+        // `data=writeback` the successor's new length can reach the disk
+        // before its data blocks, so the file arrives at full length holding
+        // only zeros. Decoding zeros fails with something other than
+        // `UnexpectedEof`, yet the chunk is as unwritten as a short one.
+        let all_zero =
+            Chunk::<WALRecord<W>>::verify_trailing_zeros(file, 0, chunk_id)?;
+
+        if all_zero {
+            return Ok(false);
+        }
+
+        Err(error)
     }
 
     fn reopen_last_closed(
