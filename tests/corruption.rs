@@ -308,3 +308,39 @@ fn test_single_bit_corruption_never_panics_or_invents_records()
 
     Ok(())
 }
+
+/// A rotation interrupted after the successor's length reached the disk but
+/// before its data blocks did.
+///
+/// The crate's failure model includes ext4 `data=writeback`, which persists a
+/// file's new length ahead of its contents. The successor chunk then survives
+/// at full length with zero content. Recovery must delete it, exactly as it
+/// deletes a successor that is merely short.
+///
+/// Truncation is disabled here so the assertion covers chunk removal alone: a
+/// tail that recovery only truncated would still leave its file behind.
+///
+/// Ignored while the defect is open: `has_complete_initial_record` maps only
+/// `UnexpectedEof` to "remove this chunk", and decoding a zero-filled record
+/// fails with `InvalidData` instead. Removing `#[ignore]` is the acceptance
+/// check for that fix.
+#[test]
+#[ignore = "open defect: zero-filled tail chunk is not removed at open"]
+fn test_zero_filled_tail_chunk_is_removed() -> Result<(), io::Error> {
+    let td = tempfile::tempdir()?;
+    let images = build_wal_image(td.path())?;
+    let tail = images.last().unwrap();
+
+    std::fs::write(&tail.path, vec![0u8; tail.bytes.len()])?;
+
+    let kept = VALUES[..VALUES.len() - 1]
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(kept, replay_without_truncation(td.path())?);
+
+    let remaining = chunk_paths(td.path())?;
+    assert_eq!(images.len() - 1, remaining.len());
+
+    Ok(())
+}
