@@ -37,6 +37,10 @@ pub trait WAL<Rec> {
     /// worker with a sync request and wait for its callback. For
     /// [`ChunkedWal`], that is `send_pending(true, Some(callback))`.
     ///
+    /// For [`ChunkedWal`], an error leaves the pending buffer and the record
+    /// index as they were, even when the encoder failed after writing part of
+    /// the record.
+    ///
     /// [`ChunkedWal`]: crate::ChunkedWal
     fn append(&mut self, rec: &Rec) -> Result<(), io::Error>;
 

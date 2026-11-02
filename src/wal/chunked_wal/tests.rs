@@ -25,6 +25,10 @@ use crate::WalTypes;
 
 const TEST_ACTION_TYPE: u32 = 1;
 
+/// A [`TestAction`] with this value writes its bytes and then fails to encode,
+/// like a codec that rejects a value halfway through.
+const FAILS_TO_ENCODE: &str = "<fails to encode>";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TestAction(String);
 
@@ -32,6 +36,14 @@ impl Encode for TestAction {
     fn encode<Wt: io::Write>(&self, mut w: Wt) -> Result<usize, io::Error> {
         let mut n = TEST_ACTION_TYPE.encode(&mut w)?;
         n += self.0.encode(&mut w)?;
+
+        if self.0 == FAILS_TO_ENCODE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "test action fails to encode",
+            ));
+        }
+
         Ok(n)
     }
 
@@ -213,6 +225,41 @@ fn test_open_append_flush_reopen() -> Result<(), io::Error> {
         assert_eq!(vec!["a", "b", "c"], sm.values);
         assert!(wal.closed.is_empty());
         assert_eq!(4, wal.open.chunk.records_count());
+    }
+
+    Ok(())
+}
+
+/// A record that fails to encode must leave nothing in the pending buffer.
+///
+/// Otherwise its partial bytes sit before the next record, a later successful
+/// flush makes them durable, and reopening fails on the malformed record.
+#[test]
+fn test_failed_encoding_leaves_no_partial_record() -> Result<(), io::Error> {
+    let (_td, config) = temp_config();
+
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (mut wal, mut sm) = open_wal(&config, calls)?;
+
+        append_action(&mut wal, &mut sm, "a")?;
+        let segment = wal.last_segment();
+        let records_count = wal.open.chunk.records_count();
+
+        let err = wal.append(&action(FAILS_TO_ENCODE)).unwrap_err();
+        assert_eq!(io::ErrorKind::InvalidInput, err.kind());
+        assert_eq!(segment, wal.last_segment());
+        assert_eq!(records_count, wal.open.chunk.records_count());
+
+        append_action(&mut wal, &mut sm, "b")?;
+        sync_flush(&mut wal)?;
+    }
+
+    {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (_wal, sm) = open_wal(&config, calls)?;
+
+        assert_eq!(vec!["a", "b"], sm.values);
     }
 
     Ok(())

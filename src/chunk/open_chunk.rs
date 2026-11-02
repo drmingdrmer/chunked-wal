@@ -108,11 +108,25 @@ where Rec: Encode
         Ok(Arc::new(f))
     }
 
+    /// Encodes `rec` into the pending buffer.
+    ///
+    /// An encoding error can come after the encoder wrote part of the record.
+    /// Those bytes are dropped before returning, so a rejected record leaves
+    /// nothing behind for the next flush to persist in front of the records
+    /// that follow it.
     pub(crate) fn append_record(
         &mut self,
         rec: &Rec,
     ) -> Result<Segment, io::Error> {
-        let size = rec.encode(&mut self.pending_data)?;
+        let pending_len = self.pending_data.len();
+
+        let size = match rec.encode(&mut self.pending_data) {
+            Ok(size) => size,
+            Err(err) => {
+                self.pending_data.truncate(pending_len);
+                return Err(err);
+            }
+        };
 
         self.chunk.append_record_size(size as u64);
 
